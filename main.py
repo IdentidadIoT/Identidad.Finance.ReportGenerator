@@ -637,6 +637,114 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
     except Exception as ex:
         logger.exception("Error in generate_answer_files")
 
+def get_monthly_sms(answerSmsDto):
+    id_carrier = ""
+    message = ""
+
+    try:
+        gmt_carriers = set(cfg.get_parameter("Answer", "AnswerSmsMonthlyEdrsContractors").split(",")) \
+                        .intersection(set(cfg.get_parameter("Answer", "AnswerSmsGMTContractors").split(",")))
+
+        carrier_list = fetch_carriers()
+        monthly_carriers = carrier_list[
+            carrier_list["CarrierId"].astype(str).isin(cfg.get_parameter("Answer", "AnswerSmsMonthlyEdrsContractors").split(","))
+        ]
+
+        if monthly_carriers.empty:
+            message = "No carriers found for Answer Sms Monthly EDR special carriers."
+            logger.warning(message)
+            send_email(to_emails, message, message)
+            return
+
+        for billing_cycle_id in answerSmsDto["ClientBillingCycleId"]:
+            answer_sms_excel_dtos = []
+            data = []
+
+            billingCycleDateDto = calculate_query_dates_by_billing_cycle(answerSmsDto, billing_cycle_id)
+
+            for _, carrier in monthly_carriers.iterrows():
+                customBillingCycleDateDto = BillingCycleDateDto(
+                    StartDate=billingCycleDateDto.StartDate,
+                    EndDate=billingCycleDateDto.EndDate
+                )
+
+                if str(carrier["CarrierId"]) in gmt_carriers:
+                    local_offset = datetime.now().astimezone().utcoffset()
+                    current_offset_hours = int(local_offset.total_seconds() / 3600)
+                    custom_time_span = current_offset_hours if carrier["CustomGMT"] == 0 else current_offset_hours - carrier["CustomGMT"]
+
+                    customBillingCycleDateDto = BillingCycleDateDto(
+                        StartDate=billingCycleDateDto.StartDate + timedelta(hours=custom_time_span),
+                        EndDate=billingCycleDateDto.EndDate + timedelta(hours=custom_time_span),
+                    )
+
+                df = fetch_AnswerOriginateSms_By_date_carrier(
+                    carrier, 
+                    customBillingCycleDateDto.StartDate, 
+                    customBillingCycleDateDto.EndDate, 
+                    isAnswer=True
+                )
+
+                if df.empty:
+                    continue
+
+                grouped = (
+                    df.groupby(
+                        ["ClientId", "Client", "ClientProduct", "ClientCountry",
+                         "ClientNet", "ClientMccMnc", "ClientCurrencyCode", "ClientRate"],
+                        dropna=False
+                    ).agg(
+                        QuantityC=("QuantityC", "sum"),
+                        ClientAmount=("ClientAmount", "sum"),
+                    ).reset_index()
+                )
+
+                for _, row in grouped.iterrows():
+                    dto = AnswerOriginateSmsDto(
+                        ClientId=row["ClientId"],
+                        Client=row["Client"],
+                        ClientProduct=row["ClientProduct"],
+                        ClientCountry=row["ClientCountry"],
+                        ClientNet=row["ClientNet"],
+                        ClientMccMnc=row["ClientMccMnc"],
+                        ClientCurrencyCode=row["ClientCurrencyCode"],
+                        ClientRate=row["ClientRate"],
+                        QuantityC=row["QuantityC"],
+                        ClientAmount=row["ClientAmount"],
+                        ClientAmountUSD=None, 
+                    )
+                    answer_sms_excel_dtos.append(dto)
+
+            for carrier_id in cfg.get_parameter("Answer", "AnswerSmsMonthlyEdrsContractors").split(","):
+                id_carrier = carrier_id
+                carrier_row = monthly_carriers[monthly_carriers["CarrierId"].astype(str) == carrier_id]
+                carrier_name = carrier_row["Name"].values[0] if not carrier_row.empty else "UnknownCarrier"
+
+                data_by_carrier = [d for d in answer_sms_excel_dtos if str(d.ClientId) == carrier_id]
+
+                if data_by_carrier:
+                    df_export = pd.DataFrame([d.__dict__ for d in data_by_carrier])
+                    file_name = f"Monthly_AnswerSms_EDR_{carrier_name}_{(billingCycleDateDto.StartDate):%m%d%Y}-{(billingCycleDateDto.EndDate):%m%d%Y}.csv"
+                    output_path = os.path.join("output", file_name)
+                    os.makedirs("output", exist_ok=True)
+
+                    try:
+                        df_export.to_csv(output_path, index=False)
+                        upload_sharepoint(output_path, file_name)
+                    except Exception as ex:
+                        message = f"There was an error while uploading the CSV file for {carrier_name}, Error: {str(ex)}"
+                        logger.error(message)
+                        send_email(to_emails, "Error uploading Answer SMS Monthly EDR", message)
+                else:
+                    message = f"There was no EDR data for the Answer Sms Monthly carrier: {carrier_name}."
+                    logger.warning(message)
+                    send_email(to_emails, "No Data for Answer SMS Monthly EDR", message)
+
+    except Exception as ex:
+        message = f"There was an unexpected error while exporting Answer Sms Monthly EDR for carrier id: {id_carrier}. Error: {str(ex)}"
+        logger.error(message)
+        send_email(to_emails, "Error Answer SMS Monthly EDR", message)
+
 
 @app.get("/")
 async def read_root():
@@ -910,6 +1018,19 @@ async def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, bil
     
     loop = asyncio.get_event_loop()
     loop.create_task(asyncio.to_thread(generate_answer_files_gmt_carriers, answer_dto))
+
+    return JSONResponse(content={"message": "The request was created successfully."})
+
+@app.post("/api/sms/RawAnswerSm/MonthlyEdrs")
+async def get_answer_sms_get_monthly(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, background_tasks: BackgroundTasks = None):
+    
+    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate}
+    
+    loop = asyncio.get_event_loop()
+    loop.create_task(asyncio.to_thread(get_monthly_sms, answer_dto))
 
     return JSONResponse(content={"message": "The request was created successfully."})
 
