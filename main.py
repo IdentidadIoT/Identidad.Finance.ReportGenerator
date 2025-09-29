@@ -104,22 +104,6 @@ class ExcelImporterSmsDto:
     Messages: int
     
 @dataclass
-class ExcelImporterSmsDto:
-    InvoiceNumber: int
-    Destination: str
-    ItemCode: str
-    Customer: str
-    Class: str
-    Period: str
-    CreationDate: str
-    Terms: str
-    DueDate: str
-    EmailSent: str
-    Note: str
-    Rate: float
-    Messages: int
-
-@dataclass
 class AnswerOriginateSmsDto:
     ClientId: Optional[int]
     Client: Optional[str]
@@ -322,7 +306,7 @@ def create_answer_importer_excel_dto_(answer_or_dto: Any, billing_cycle_date_dto
         Destination=financial_row["Name"] if financial_row is not None else get(answer_data, "ClientCountry"),
         ItemCode=financial_row["Item"] if financial_row is not None else get(answer_data, "ClientCountry"),
         Customer=customer_value,
-        Class=financial_row["Class"] if financial_row is not None else "DefaultFinancialClass",
+        Class_=financial_row["Class"] if financial_row is not None else "DefaultFinancialClass",
         Period=period,
         CreationDate=creation_date,
         Terms=terms,
@@ -902,7 +886,7 @@ async def raw_originate_sms_customGmt(billingCycleDate: BillingCycleDateDto, bil
         return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
 
 @app.post("/api/sms/RawAnswerSms")
-def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, background_tasks: BackgroundTasks = None):
+async def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, background_tasks: BackgroundTasks = None):
     
     answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "InvoiceNumber": InvoiceNumber, 
@@ -910,12 +894,13 @@ def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: Billing
                   "CarrierBillingCycleId": [int(billing_cycle)],
                   "billingCycleDate": billingCycleDate}
     
-    generate_answer_files(answer_dto)
+    loop = asyncio.get_event_loop()
+    loop.create_task(asyncio.to_thread(generate_answer_files, answer_dto))
 
     return JSONResponse(content={"message": "The request was created successfully."})
 
 @app.post("/api/sms/RawAnswerSm/GMTCarriers")
-def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, background_tasks: BackgroundTasks = None):
+async def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, background_tasks: BackgroundTasks = None):
     
     answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "InvoiceNumber": InvoiceNumber, 
@@ -923,7 +908,8 @@ def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, billing_c
                   "CarrierBillingCycleId": [int(billing_cycle)],
                   "billingCycleDate": billingCycleDate}
     
-    generate_answer_files_gmt_carriers(answer_dto)
+    loop = asyncio.get_event_loop()
+    loop.create_task(asyncio.to_thread(generate_answer_files_gmt_carriers, answer_dto))
 
     return JSONResponse(content={"message": "The request was created successfully."})
 
