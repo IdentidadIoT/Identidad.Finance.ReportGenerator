@@ -1034,8 +1034,16 @@ async def get_answer_sms_get_monthly(billingCycleDate: BillingCycleDateDto, bill
 
     return JSONResponse(content={"message": "The request was created successfully."})
 
+import uvicorn
 
-init()
-logger.debug('-----------------Init Application------------------------')
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
+    )
+    init()
+    logger.debug('-----------------Init Application------------------------')
 
 # Para ejecutar: uvicorn main:app --port 8000 --reload
