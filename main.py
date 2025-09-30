@@ -19,18 +19,22 @@ import re
 import time
 import pytz
 import asyncio
+import uvicorn
 from enum import IntEnum
-from types import SimpleNamespace
+
+
+global config, logger, interval_time, to_emails, to_emails_filtered_report
 
 
 app = FastAPI()
+logger = init_log()
 
 
 def init():
-    global config, logger, interval_time, to_emails, to_emails_filtered_report
 
+    global config, logger, interval_time, to_emails, to_emails_filtered_report
     config = init_config()
-    logger = init_log()
+
     init_email()
     init_sharepoint()
     try:
@@ -124,7 +128,6 @@ class CarrierCurrencyDto:
 
 
 def _get_val(obj: Any, attr: str, default=None):
-    """Accesible para dicts o objetos (SimpleNamespace/dataclass/Pydantic)."""
     if obj is None:
         return default
     if isinstance(obj, dict):
@@ -1034,16 +1037,17 @@ async def get_answer_sms_get_monthly(billingCycleDate: BillingCycleDateDto, bill
 
     return JSONResponse(content={"message": "The request was created successfully."})
 
-import uvicorn
+init()
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
-    init()
+
     logger.debug('-----------------Init Application------------------------')
 
-# Para ejecutar: uvicorn main:app --port 8000 --reload
+    uvicorn.run(
+         "main:app",
+         host="0.0.0.0",
+         port=int(cfg.get_parameter("General", "port")),
+         reload=True
+    )
+
+# Para ejecutar: uvicorn main:app --port 8001 --reload

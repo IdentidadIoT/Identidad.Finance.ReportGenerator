@@ -40,12 +40,5 @@ def init_log():
         print("Error initializing logger:", err)
         raise
 
-def get_logger():
-    if logging:
-        return logging
-    else:
-        return init_log()
-
-if __name__ == '__main__':
-    log = init_log()
-    log.debug('-----------------Init Logger------------------------')
+def get_logger(name="sms_api"):
+    return logging.getLogger(name)
