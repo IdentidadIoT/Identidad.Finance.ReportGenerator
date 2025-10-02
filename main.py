@@ -1,13 +1,11 @@
-from fastapi import FastAPI, Request, BackgroundTasks
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 import pandas as pd
-import numpy as np
-from sqlalchemy import text
 from core.db import get_engine
 from core.logger import init_log
 from core.sharepoint import init_sharepoint, upload_sharepoint
@@ -21,18 +19,20 @@ import pytz
 import asyncio
 import uvicorn
 from enum import IntEnum
+import uuid
 
 
-global config, logger, interval_time, to_emails, to_emails_filtered_report
+global config, logger, interval_time, to_emails, to_emails_filtered_report, semaphore
 
-
+jobs: Dict[str, dict] = {}
 app = FastAPI()
 logger = init_log()
 
 
 def init():
+    global config, logger, interval_time, to_emails, to_emails_filtered_report, semaphore
 
-    global config, logger, interval_time, to_emails, to_emails_filtered_report
+    semaphore = asyncio.Semaphore(5)
     config = init_config()
 
     init_email()
@@ -61,6 +61,39 @@ async def log_requests(request: Request, call_next):
     duration = time.time() - start_time
     logger.info(f"{request.method} {request.url.path} - END in {duration:.2f}s")
     return response
+
+def register_job(func, *args, **kwargs):
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "pending/queued", 
+                    "result": None, 
+                    "error": None,
+                    "request": {
+                            "function": func.__name__,
+                            "args": args,
+                        }
+                }
+
+    async def wrapper():
+        async with semaphore:
+            try:
+                jobs[job_id]["status"] = "running"
+                result = await asyncio.to_thread(func, *args, **kwargs)
+
+                if isinstance(result, dict) and "status_code" in result:
+                    jobs[job_id]["status"] = "done" if result["status_code"] == 200 else "error"
+                    jobs[job_id]["result"] = str(result)
+                else:
+                    jobs[job_id]["status"] = "done"
+                    jobs[job_id]["result"] = result
+
+            except Exception as e:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"] = str(e)
+                logger.exception(f"Error ejecutando job {job_id} ({func.__name__})")
+
+    loop = asyncio.get_event_loop()
+    loop.create_task(wrapper())
+    return job_id
 
 
 def sanitize_filename(filename: str) -> str:
@@ -134,16 +167,6 @@ class CarrierCurrencyDto:
     Result: bool  # True = single currency, False = multi-currency
 
 
-def _get_val(obj: Any, attr: str, default=None):
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(attr, default)
-    return getattr(obj, attr, default)
-
-def df_column_safe(df: pd.DataFrame, col: str, default=None):
-    return df[col] if col in df.columns else pd.Series([default] * len(df))
-
 def set_dates_from_input(start: datetime, end: datetime) -> BillingCycleDateDto:
     return BillingCycleDateDto(StartDate=start, EndDate=end)
 
@@ -182,6 +205,7 @@ def calculate_query_dates_by_billing_cycle(answer_dto: BillingCycleDateDto, bill
     # default / BIWEEKLY
     return set_dates_from_input(answer_dto.StartDate, answer_dto.EndDate)
 
+
 def fetch_carriers() -> pd.DataFrame:
     try:
         engine = get_engine()
@@ -208,10 +232,11 @@ def fetch_financial_area_equivalence() -> pd.DataFrame:
         logger.exception("Error fetching FinancialAreaEquivalence data: %s", str(ex))
         return pd.DataFrame()
 
-def raw_originate_sms_customGmt_fun(answer_dto):
+
+def raw_originate_sms_customGmt_fun(originateSmsDto):
     try:
         df_carriers = fetch_carriers()
-        billingCycleDate = calculate_query_dates_by_billing_cycle(answer_dto["billingCycleDate"], answer_dto["ClientBillingCycleId"][0])
+        billingCycleDate = calculate_query_dates_by_billing_cycle(originateSmsDto["billingCycleDate"], originateSmsDto["ClientBillingCycleId"][0])
         frames = []
 
         for custom_gmt, group in df_carriers.groupby("CustomGMT"):
@@ -236,7 +261,7 @@ def raw_originate_sms_customGmt_fun(answer_dto):
         logger.info("Data fetched, number of rows: %d", len(df))
 
         if df.empty:
-            return JSONResponse(content={"message": "data not found for the given date range", "rows": 0}, status_code=200)
+            return {"content":{"message": "data not found for the given date range", "rows": 0}, "status_code":200}
 
         grouped = df.groupby([
             "VendorId", "Vendor", "VendorProduct", "VendorCountry", "VendorNet",
@@ -267,7 +292,7 @@ def raw_originate_sms_customGmt_fun(answer_dto):
             })
 
         df_output = pd.DataFrame(rows)
-        filename = sanitize_filename(f"RawOriginateSMS_CustomGMT_{BillingCycle(answer_dto['VendorBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
+        filename = sanitize_filename(f"RawOriginateSMS_CustomGMT_{BillingCycle(originateSmsDto['VendorBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
         output_folder = "output"
         os.makedirs(output_folder, exist_ok=True)
         output_path = os.path.join(output_folder, filename)
@@ -277,11 +302,11 @@ def raw_originate_sms_customGmt_fun(answer_dto):
             upload_sharepoint(output_path, filename)
         except Exception:
             logger.exception("Error uploading raw originate CSV to sharepoint")
-        return JSONResponse(content={"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
+        return {"content":{"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, "status_code":200}
     except Exception as ex:
         logger.exception("Error procesando reporte raw originate")
         send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
-        return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
+        return {"status_code":500, "content":{"error": f"Error procesando reporte: {str(ex)}"}}
 
 def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, end_date: datetime, isAnswer: bool) -> pd.DataFrame:
     try:
@@ -531,7 +556,7 @@ def generate_answer_files(answerSmsDto):
 
     except Exception as ex:
         logger.exception("Error in generate_answer_files")
-        #return JSONResponse(status_code=500, content={"error": str(ex)})
+        return {"status_code":500, "content":{"error": str(ex)}}
 
 def generate_answer_files_gmt_carriers(answerSmsDto):
     try:
@@ -635,7 +660,7 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
     except Exception as ex:
         logger.exception("Error in generate_answer_files")
 
-def get_monthly_sms(answerSmsDto):
+def get_answer_sms_get_monthly_fun(answerSmsDto):
     id_carrier = ""
     message = ""
 
@@ -743,79 +768,7 @@ def get_monthly_sms(answerSmsDto):
         logger.error(message)
         send_email(to_emails, "Error Answer SMS Monthly EDR", message)
 
-
-@app.get("/")
-async def read_root():
-    try:
-        send_email(to_emails, "test email to_emails", "test email to_emails")
-        send_email(to_emails_filtered_report, "test email to_emails_filtered_report", "test email to_emails_filtered_report")
-    except Exception:
-        logger.exception("Error sending test emails")
-    return {"message": "API de FastAPI conectada a SQL Server"}
-
-@app.post("/api/sms/RawOriginateSms")
-async def raw_originate_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    try:
-        df_carriers = fetch_carriers()
-        billingCycleDate = calculate_query_dates_by_billing_cycle(billingCycleDate, billing_cycle)
-        df = fetch_AnswerOriginateSms_By_date_carrier(df_carriers, billingCycleDate.StartDate, billingCycleDate.EndDate, isAnswer=False)
-        logger.info("Data fetched, number of rows: %d", len(df))
-        if df.empty:
-            return JSONResponse(content={"message": "data not found for the given date range", "rows": 0}, status_code=200)
-
-        grouped = df.groupby([
-            "VendorId", "Vendor", "VendorProduct", "VendorCountry", "VendorNet",
-            "VendorMccMnc", "VendorCurrencyCode", "VendorRate"
-        ], dropna=False)
-
-        rows = []
-        for keys, group in grouped:
-            sum_quantity = group["QuantityV"].sum()
-            sum_amount = group["VendorAmount"].sum()
-            sum_amount_usd = group["VendorAmountUSD"].sum()
-
-            carrier_info = df_carriers[df_carriers["CarrierId"].astype(str) == str(keys[0])]
-            quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
-
-            rows.append({
-                "VendorId": str(keys[0]),
-                "Vendor": keys[1],
-                "VendorProduct": keys[2],
-                "VendorCountry": keys[3],
-                "Network": keys[4],
-                "MccMnc": keys[5],
-                "VendorCurrencyCode": keys[6],
-                "VendorRate": keys[7],
-                "Messages": int(sum_quantity),
-                "VendorAmount": sum_amount,
-                "VendorAmountUSD": sum_amount_usd,
-                "VendorQuickBoxName": quickbox_name
-            })
-
-        df_output = pd.DataFrame(rows)
-        filename = sanitize_filename(f"RawOriginateSMS_{billing_cycle.name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
-        output_folder = "output"
-        os.makedirs(output_folder, exist_ok=True)
-        output_path = os.path.join(output_folder, filename)
-        df_output.to_csv(output_path, index=False)
-        logger.info("CSV file generated at: %s", output_path)
-        try:
-            upload_sharepoint(output_path, filename)
-        except Exception:
-            logger.exception("Error uploading raw originate CSV to sharepoint")
-        return JSONResponse(content={"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
-    except Exception as ex:
-        logger.exception("Error procesando reporte raw originate")
-        send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
-        return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
-
-@app.post("/api/sms/RawOriginateSms/gmt")
-async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                        "VendorBillingCycleId": [int(billing_cycle)], 
-                        "CarrierBillingCycleId": [int(billing_cycle)],
-                        "billingCycleDate": billingCycleDate}
-    
+def raw_originate_sms_gmt_fun(originateSmsDto):
     try:
 
         df_carriers = fetch_carriers()
@@ -837,13 +790,13 @@ async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_c
             msg = "No carriers found for GMT Originate report"
             logger.warning(msg)
             send_email(to_emails, "Error GMT Originate", msg)
-            return JSONResponse(content={"message": msg}, status_code=200)
+            return {"content":{"message": msg}, "status_code":200}
 
         total_rows = 0
         generated_files = []
 
         for billingCycleId in originateSmsDto["VendorBillingCycleId"]:
-            billingCycleDate = calculate_query_dates_by_billing_cycle(billingCycleDate, billingCycleId)
+            billingCycleDate = calculate_query_dates_by_billing_cycle(originateSmsDto['billingCycleDate'], billingCycleId)
             gmtDates = set_gmt_scheduled(billingCycleDate)
 
             df = fetch_AnswerOriginateSms_By_date_carrier(
@@ -899,74 +852,160 @@ async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_c
             msg = "No data found for any of the requested billing cycles"
             logger.warning(msg)
             send_email(to_emails, "Error GMT Originate", msg)
-            return JSONResponse(content={"message": msg, "rows": 0}, status_code=200)
+            return {"content":{"message": msg, "rows": 0}, "status_code":200}
 
-        return JSONResponse(
-            content={
+        return {
+            "content":{
                 "message": "GMT Originate report(s) generated successfully",
                 "files": generated_files,
                 "rows": total_rows
             },
-            status_code=200
-        )
+            "status_code":200
+        }
 
     except Exception as ex:
         logger.exception("Error generating GMT Originate SMS report")
         send_email(to_emails, "Error GMT Originate", f"Exception: {str(ex)}")
-        return JSONResponse(status_code=500, content={"error": f"Error generating report: {str(ex)}"})
+        return {"status_code":500, "message":{"error": f"Error generating report: {str(ex)}"}}
+
+def raw_originate_sms_fun(originateSmsDto):
+    try:
+        df_carriers = fetch_carriers()
+        billingCycleDate = calculate_query_dates_by_billing_cycle(originateSmsDto['billingCycleDate'], originateSmsDto['CarrierBillingCycleId'][0])
+        df = fetch_AnswerOriginateSms_By_date_carrier(df_carriers, billingCycleDate.StartDate, billingCycleDate.EndDate, isAnswer=False)
+        logger.info("Data fetched, number of rows: %d", len(df))
+        if df.empty:
+            return JSONResponse(content={"message": "data not found for the given date range", "rows": 0}, status_code=200)
+
+        grouped = df.groupby([
+            "VendorId", "Vendor", "VendorProduct", "VendorCountry", "VendorNet",
+            "VendorMccMnc", "VendorCurrencyCode", "VendorRate"
+        ], dropna=False)
+
+        rows = []
+        for keys, group in grouped:
+            sum_quantity = group["QuantityV"].sum()
+            sum_amount = group["VendorAmount"].sum()
+            sum_amount_usd = group["VendorAmountUSD"].sum()
+
+            carrier_info = df_carriers[df_carriers["CarrierId"].astype(str) == str(keys[0])]
+            quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
+
+            rows.append({
+                "VendorId": str(keys[0]),
+                "Vendor": keys[1],
+                "VendorProduct": keys[2],
+                "VendorCountry": keys[3],
+                "Network": keys[4],
+                "MccMnc": keys[5],
+                "VendorCurrencyCode": keys[6],
+                "VendorRate": keys[7],
+                "Messages": int(sum_quantity),
+                "VendorAmount": sum_amount,
+                "VendorAmountUSD": sum_amount_usd,
+                "VendorQuickBoxName": quickbox_name
+            })
+
+        df_output = pd.DataFrame(rows)
+        filename = sanitize_filename(f"RawOriginateSMS_{BillingCycle(originateSmsDto['CarrierBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
+        output_folder = "output"
+        os.makedirs(output_folder, exist_ok=True)
+        output_path = os.path.join(output_folder, filename)
+        df_output.to_csv(output_path, index=False)
+        logger.info("CSV file generated at: %s", output_path)
+        try:
+            upload_sharepoint(output_path, filename)
+        except Exception:
+            logger.exception("Error uploading raw originate CSV to sharepoint")
+        return JSONResponse(content={"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
+    except Exception as ex:
+        logger.exception("Error procesando reporte raw originate")
+        send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
+        return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
+
+
+@app.get("/")
+async def email_test():
+    try:
+        send_email(to_emails, "test email to_emails", "test email to_emails")
+        send_email(to_emails_filtered_report, "test email to_emails_filtered_report", "test email to_emails_filtered_report")
+    except Exception:
+        logger.exception("Error sending test emails")
+    return {"message": "emails sends succesfull"}
+
+@app.get("/api/sms/jobs")
+async def get_jobs():
+    return {"Status:": "pending/queued → created but not started yet.  running → currently in execution.  done → finished successfully.  error → finished with an exception.",
+            "List of jobs": jobs            
+            }
+
+
+@app.post("/api/sms/RawOriginateSms")
+async def raw_originate_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
+    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                        "VendorBillingCycleId": [int(billing_cycle)], 
+                        "CarrierBillingCycleId": [int(billing_cycle)],
+                        "billingCycleDate": billingCycleDate}
+    
+    job_id = register_job(raw_originate_sms_fun, originateSmsDto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+@app.post("/api/sms/RawOriginateSms/gmt")
+async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
+    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                        "VendorBillingCycleId": [int(billing_cycle)], 
+                        "CarrierBillingCycleId": [int(billing_cycle)],
+                        "billingCycleDate": billingCycleDate}
+    
+    job_id = register_job(raw_originate_sms_gmt_fun, originateSmsDto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
 
 @app.post("/api/sms/RawOriginateSms/CustomGmt")
 async def raw_originate_sms_customGmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "VendorBillingCycleId": [int(billing_cycle)], 
                   "CarrierBillingCycleId": [int(billing_cycle)],
                   "billingCycleDate": billingCycleDate}
-    
-    loop = asyncio.get_event_loop()
-    loop.create_task(asyncio.to_thread(raw_originate_sms_customGmt_fun, answer_dto))
 
-    return JSONResponse(content={"message": "The request was created successfully."})
+    job_id = register_job(raw_originate_sms_customGmt_fun, originateSmsDto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
 
 @app.post("/api/sms/RawAnswerSms")
-async def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, background_tasks: BackgroundTasks = None):
+async def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int):
     
     answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "InvoiceNumber": InvoiceNumber, 
                   "VendorBillingCycleId": [int(billing_cycle)], 
                   "CarrierBillingCycleId": [int(billing_cycle)],
                   "billingCycleDate": billingCycleDate}
-    
-    loop = asyncio.get_event_loop()
-    loop.create_task(asyncio.to_thread(generate_answer_files, answer_dto))
 
-    return JSONResponse(content={"message": "The request was created successfully."})
+    job_id = register_job(generate_answer_files, answer_dto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
 
 @app.post("/api/sms/RawAnswerSm/GMTCarriers")
-async def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, background_tasks: BackgroundTasks = None):
+async def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int):
     
     answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "InvoiceNumber": InvoiceNumber, 
                   "VendorBillingCycleId": [int(billing_cycle)], 
                   "CarrierBillingCycleId": [int(billing_cycle)],
                   "billingCycleDate": billingCycleDate}
-    
-    loop = asyncio.get_event_loop()
-    loop.create_task(asyncio.to_thread(generate_answer_files_gmt_carriers, answer_dto))
 
-    return JSONResponse(content={"message": "The request was created successfully."})
+    job_id = register_job(generate_answer_files_gmt_carriers, answer_dto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
 
 @app.post("/api/sms/RawAnswerSm/MonthlyEdrs")
-async def get_answer_sms_get_monthly(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, background_tasks: BackgroundTasks = None):
+async def get_answer_sms_get_monthly(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
     
     answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "VendorBillingCycleId": [int(billing_cycle)], 
                   "CarrierBillingCycleId": [int(billing_cycle)],
                   "billingCycleDate": billingCycleDate}
     
-    loop = asyncio.get_event_loop()
-    loop.create_task(asyncio.to_thread(get_monthly_sms, answer_dto))
+    job_id = register_job(get_answer_sms_get_monthly_fun, answer_dto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
 
-    return JSONResponse(content={"message": "The request was created successfully."})
 
 init()
 
@@ -977,8 +1016,7 @@ if __name__ == "__main__":
     uvicorn.run(
          "main:app",
          host="0.0.0.0",
-         port=int(cfg.get_parameter("General", "port")),
-         reload=True
+         port=int(cfg.get_parameter("General", "port"))
     )
 
 # Para ejecutar: uvicorn main:app --port 8001 --reload
