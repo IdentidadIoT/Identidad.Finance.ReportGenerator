@@ -66,6 +66,12 @@ async def log_requests(request: Request, call_next):
 def sanitize_filename(filename: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', filename)
 
+def safe_float(val):
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 class BillingCycleDateDto(BaseModel):
     StartDate: datetime
@@ -93,10 +99,10 @@ class FinancialAreaEquivalenceDto(BaseModel):
 
 @dataclass
 class ExcelImporterSmsDto:
-    InvoiceNumber: int
-    Destination: str
-    ItemCode: str
     Customer: str
+    InvoiceNumber: str
+    ItemCode: str
+    Destination: str
     Class_: str
     Period: str
     CreationDate: str
@@ -106,6 +112,7 @@ class ExcelImporterSmsDto:
     Note: str
     Rate: float
     Messages: int
+    Amount: float
     
 @dataclass
 class AnswerOriginateSmsDto:
@@ -201,6 +208,81 @@ def fetch_financial_area_equivalence() -> pd.DataFrame:
         logger.exception("Error fetching FinancialAreaEquivalence data: %s", str(ex))
         return pd.DataFrame()
 
+def raw_originate_sms_customGmt_fun(answer_dto):
+    try:
+        df_carriers = fetch_carriers()
+        billingCycleDate = calculate_query_dates_by_billing_cycle(answer_dto["billingCycleDate"], answer_dto["ClientBillingCycleId"][0])
+        frames = []
+
+        for custom_gmt, group in df_carriers.groupby("CustomGMT"):
+            local_offset = datetime.now().astimezone().utcoffset()
+            current_offset_hours = int(local_offset.total_seconds() / 3600)
+
+            custom_time_span = current_offset_hours if custom_gmt == 0 else current_offset_hours - custom_gmt
+
+            start_date = billingCycleDate.StartDate + timedelta(hours=custom_time_span)
+            end_date = billingCycleDate.EndDate + timedelta(hours=custom_time_span)
+
+            # pasar el sub-dataframe con todos los CarrierId del grupo
+            df_result = fetch_AnswerOriginateSms_By_date_carrier(group, start_date, end_date, isAnswer=False)
+            frames.append(df_result)
+
+        frames_non_empty = [f for f in frames if not f.empty]
+        if frames_non_empty:
+            df = pd.concat(frames_non_empty, ignore_index=True)
+        else:
+            df = pd.DataFrame()
+
+        logger.info("Data fetched, number of rows: %d", len(df))
+
+        if df.empty:
+            return JSONResponse(content={"message": "data not found for the given date range", "rows": 0}, status_code=200)
+
+        grouped = df.groupby([
+            "VendorId", "Vendor", "VendorProduct", "VendorCountry", "VendorNet",
+            "VendorMccMnc", "VendorCurrencyCode", "VendorRate"
+        ], dropna=False)
+
+        rows = []
+        for keys, group in grouped:
+            sum_quantity = group["QuantityV"].sum()
+            sum_amount = group["VendorAmount"].sum()
+            sum_amount_usd = group["VendorAmountUSD"].sum()
+            carrier_info = df_carriers[df_carriers["CarrierId"].astype(str) == str(keys[0])]
+            quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
+
+            rows.append({
+                "VendorId": str(keys[0]),
+                "Vendor": keys[1],
+                "VendorProduct": keys[2],
+                "VendorCountry": keys[3],
+                "Network": keys[4],
+                "MccMnc": keys[5],
+                "VendorCurrencyCode": keys[6],
+                "VendorRate": keys[7],
+                "Messages": int(sum_quantity),
+                "VendorAmount": sum_amount,
+                "VendorAmountUSD": sum_amount_usd,
+                "VendorQuickBoxName": quickbox_name
+            })
+
+        df_output = pd.DataFrame(rows)
+        filename = sanitize_filename(f"RawOriginateSMS_CustomGMT_{BillingCycle(answer_dto['VendorBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
+        output_folder = "output"
+        os.makedirs(output_folder, exist_ok=True)
+        output_path = os.path.join(output_folder, filename)
+        df_output.to_csv(output_path, index=False)
+        logger.info("CSV file generated at: %s", output_path)
+        try:
+            upload_sharepoint(output_path, filename)
+        except Exception:
+            logger.exception("Error uploading raw originate CSV to sharepoint")
+        return JSONResponse(content={"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
+    except Exception as ex:
+        logger.exception("Error procesando reporte raw originate")
+        send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
+        return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
+
 def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, end_date: datetime, isAnswer: bool) -> pd.DataFrame:
     try:
         engine = get_engine()
@@ -233,94 +315,6 @@ def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, 
     except Exception as ex:
         logger.exception("Error fetching AnswerOriginateSms data: %s", str(ex))
         return pd.DataFrame()
-
-def create_answer_importer_excel_dto_(answer_or_dto: Any, billing_cycle_date_dto: BillingCycleDateDto, answer_data: Any,
-                                     carrier_list: pd.DataFrame, financial_area_equivalence_dto_list: pd.DataFrame,
-                                     answer_importer_sms_excel_dtos: List[ExcelImporterSmsDto], list_clients: pd.DataFrame):
-
-    def get(ad, key, default=None):
-        return _get_val(ad, key, default)
-
-    client_id = get(answer_data, "ClientId")
-    client_id_str = str(client_id) if client_id else None
-
-    # Buscar carrier
-    carrier_row = None
-    if client_id_str and "CarrierId" in carrier_list.columns:
-        matching = carrier_list[carrier_list["CarrierId"].astype(str) == client_id_str]
-        if not matching.empty:
-            carrier_row = matching.iloc[0]
-
-    # Buscar equivalencia financiera
-    financial_row = None
-    if "Name" in financial_area_equivalence_dto_list.columns and get(answer_data, "ClientCountry"):
-        match = financial_area_equivalence_dto_list[
-            financial_area_equivalence_dto_list["Name"].str.upper().str.strip() ==
-            get(answer_data, "ClientCountry", "").upper().strip()
-        ]
-        if not match.empty:
-            financial_row = match.iloc[0]
-
-    # Validar multi-currency
-    carrier_currency_row = None
-    if not list_clients.empty and "ClientId" in list_clients.columns:
-        cur_match = list_clients[list_clients["ClientId"] == client_id]
-        if not cur_match.empty:
-            carrier_currency_row = cur_match.iloc[0]
-
-    # Customer
-    if carrier_row is None:
-        customer_value = f"carrier no existe {get(answer_data, 'Client')}"
-    else:
-        quickbox = carrier_row.get("ClientQuickBoxName") or f"Nombre Quickbox no existe {carrier_row.get('Name')}"
-        multi_currency = False if carrier_currency_row is None else not bool(carrier_currency_row["Result"])
-        if multi_currency:
-            cur_code = get(answer_data, "ClientCurrencyCode", "")
-            customer_value = f"{quickbox}_{cur_code.lower()}"
-        else:
-            customer_value = quickbox
-
-    # InvoiceNumber: se incrementa solo si cambia el Customer
-    change_invoice = False
-    if answer_importer_sms_excel_dtos:
-        last_customer = answer_importer_sms_excel_dtos[-1].Customer
-        if last_customer != customer_value:
-            answer_or_dto["InvoiceNumber"] += 1
-            change_invoice = True
-
-    # Fechas
-    period = f"{billing_cycle_date_dto.StartDate.strftime('%Y-%m-%d')} to {(billing_cycle_date_dto.EndDate - timedelta(days=1)).strftime('%Y-%m-%d')}"
-    creation_date = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-
-    if carrier_row is not None:
-        terms_days = int(carrier_row.get("ClientPaymentTerms", 0) or 0)
-        terms = f"{terms_days} DAYS"
-        due_date = (datetime.now() + timedelta(days=terms_days - 1 if terms_days > 0 else 0)).strftime('%Y-%m-%d')
-    else:
-        terms = f"carrier no existe {get(answer_data, 'Client')}"
-        due_date = terms
-
-    # Config
-    email_sent = cfg.get_parameter("Answer", "AnswerEmailSend")
-    note = cfg.get_parameter("Answer", "AnswerFinancialNote")
-
-    dto = ExcelImporterSmsDto(
-        InvoiceNumber=answer_or_dto["InvoiceNumber"],
-        Destination=financial_row["Name"] if financial_row is not None else get(answer_data, "ClientCountry"),
-        ItemCode=financial_row["Item"] if financial_row is not None else get(answer_data, "ClientCountry"),
-        Customer=customer_value,
-        Class_=financial_row["Class"] if financial_row is not None else "DefaultFinancialClass",
-        Period=period,
-        CreationDate=creation_date,
-        Terms=terms,
-        DueDate=due_date,
-        EmailSent=email_sent,
-        Note=note,
-        Rate=get(answer_data, "ClientRate", 0.0),
-        Messages=int(get(answer_data, "QuantityC", 0))
-    )
-
-    answer_importer_sms_excel_dtos.append(dto)
 
 def set_gmt_scheduled(billingCycleDateDto: BillingCycleDateDto) -> BillingCycleDateDto:
     local_tz = datetime.now().astimezone().tzinfo
@@ -386,10 +380,10 @@ def create_answer_importer_excel_dto(
     note = cfg.get_parameter("Answer", "AnswerFinancialNote")
 
     dto = ExcelImporterSmsDto(
-        InvoiceNumber=answer_or_dto["InvoiceNumber"],
-        Destination=financial["Name"] if financial is not None else answer_data.ClientCountry,
-        ItemCode=financial["Item"] if financial is not None else answer_data.ClientCountry,
         Customer=customer_value,
+        InvoiceNumber="Insert Bill Number" if len(answer_importer_sms_excel_dtos) == 0 else f"=IF(A{len(answer_importer_sms_excel_dtos)+2} = A{len(answer_importer_sms_excel_dtos)+1}, B{len(answer_importer_sms_excel_dtos)+1},B{len(answer_importer_sms_excel_dtos)+1}+1)",
+        ItemCode=financial["Item"] if financial is not None else answer_data.ClientCountry,
+        Destination=financial["Name"] if financial is not None else answer_data.ClientCountry,
         Class_=financial["Class"] if financial is not None else "DefaultFinancialClass",
         Period=period,
         CreationDate=creation_date,
@@ -397,8 +391,9 @@ def create_answer_importer_excel_dto(
         DueDate=due_date,
         EmailSent=email_sent,
         Note=note,
-        Rate=answer_data.ClientRate,
-        Messages=answer_data.QuantityC
+        Rate=safe_float(answer_data.ClientRate),
+        Messages=safe_float(answer_data.QuantityC),
+        Amount=safe_float(answer_data.ClientRate) * safe_float(answer_data.QuantityC)
     )
 
     answer_importer_sms_excel_dtos.append(dto)
@@ -426,6 +421,8 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
     for carrier_id in gmt_carriers["CarrierId"].astype(str).tolist():
         data = [d for d in data if d.ClientId != int(carrier_id)]
 
+    data = sorted(data, key=lambda x: (x.Client, x.ClientCountry,))
+
     answerImporterExcelDtos: List[ExcelImporterSmsDto] = []
     for d in data:
         create_answer_importer_excel_dto(answerOrDto, billingCycleDateDto, d, carrier_list, 
@@ -433,17 +430,15 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
 
     if answerImporterExcelDtos:
         df_importer = pd.DataFrame([dto.__dict__ for dto in answerImporterExcelDtos])
-        df_importer = df_importer.sort_values(by=["Customer", "InvoiceNumber"], ascending=[True, True])
         
         if gmtCarriers:
-            report_name = f"AnswerImporter_forGMT{gmt}_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.csv"
+            report_name = f"AnswerImporter_forGMT{gmt}_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.xlsx"
         else:
-            report_name = f"AnswerImporter_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.csv"
+            report_name = f"AnswerImporter_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.xlsx"
         output_path = os.path.join("output", report_name)
         os.makedirs("output", exist_ok=True)
-        df_importer.to_csv(output_path, index=False)
+        df_importer.to_excel(output_path, index=False)
 
-        answerOrDto["InvoiceNumber"] += 1
         logger.info("Raw Excel file generated at: %s", output_path) 
                 
         try: 
@@ -922,79 +917,15 @@ async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_c
 
 @app.post("/api/sms/RawOriginateSms/CustomGmt")
 async def raw_originate_sms_customGmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    try:
-        df_carriers = fetch_carriers()
-        billingCycleDate = calculate_query_dates_by_billing_cycle(billingCycleDate, billing_cycle)
-        frames = []
+    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate}
+    
+    loop = asyncio.get_event_loop()
+    loop.create_task(asyncio.to_thread(raw_originate_sms_customGmt_fun, answer_dto))
 
-        for custom_gmt, group in df_carriers.groupby("CustomGMT"):
-            local_offset = datetime.now().astimezone().utcoffset()
-            current_offset_hours = int(local_offset.total_seconds() / 3600)
-
-            custom_time_span = current_offset_hours if custom_gmt == 0 else current_offset_hours - custom_gmt
-
-            start_date = billingCycleDate.StartDate + timedelta(hours=custom_time_span)
-            end_date = billingCycleDate.EndDate + timedelta(hours=custom_time_span)
-
-            # pasar el sub-dataframe con todos los CarrierId del grupo
-            df_result = fetch_AnswerOriginateSms_By_date_carrier(group, start_date, end_date, isAnswer=False)
-            frames.append(df_result)
-
-        frames_non_empty = [f for f in frames if not f.empty]
-        if frames_non_empty:
-            df = pd.concat(frames_non_empty, ignore_index=True)
-        else:
-            df = pd.DataFrame()
-
-        logger.info("Data fetched, number of rows: %d", len(df))
-
-        if df.empty:
-            return JSONResponse(content={"message": "data not found for the given date range", "rows": 0}, status_code=200)
-
-        grouped = df.groupby([
-            "VendorId", "Vendor", "VendorProduct", "VendorCountry", "VendorNet",
-            "VendorMccMnc", "VendorCurrencyCode", "VendorRate"
-        ], dropna=False)
-
-        rows = []
-        for keys, group in grouped:
-            sum_quantity = group["QuantityV"].sum()
-            sum_amount = group["VendorAmount"].sum()
-            sum_amount_usd = group["VendorAmountUSD"].sum()
-            carrier_info = df_carriers[df_carriers["CarrierId"].astype(str) == str(keys[0])]
-            quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
-
-            rows.append({
-                "VendorId": str(keys[0]),
-                "Vendor": keys[1],
-                "VendorProduct": keys[2],
-                "VendorCountry": keys[3],
-                "Network": keys[4],
-                "MccMnc": keys[5],
-                "VendorCurrencyCode": keys[6],
-                "VendorRate": keys[7],
-                "Messages": int(sum_quantity),
-                "VendorAmount": sum_amount,
-                "VendorAmountUSD": sum_amount_usd,
-                "VendorQuickBoxName": quickbox_name
-            })
-
-        df_output = pd.DataFrame(rows)
-        filename = sanitize_filename(f"RawOriginateSMS_CustomGMT_{billing_cycle.name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
-        output_folder = "output"
-        os.makedirs(output_folder, exist_ok=True)
-        output_path = os.path.join(output_folder, filename)
-        df_output.to_csv(output_path, index=False)
-        logger.info("CSV file generated at: %s", output_path)
-        try:
-            upload_sharepoint(output_path, filename)
-        except Exception:
-            logger.exception("Error uploading raw originate CSV to sharepoint")
-        return JSONResponse(content={"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
-    except Exception as ex:
-        logger.exception("Error procesando reporte raw originate")
-        send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
-        return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
+    return JSONResponse(content={"message": "The request was created successfully."})
 
 @app.post("/api/sms/RawAnswerSms")
 async def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, background_tasks: BackgroundTasks = None):
