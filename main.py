@@ -118,9 +118,10 @@ class BillingCycleDateDto(BaseModel):
 class BillingCycle(IntEnum):
     PREPAY = 1
     WEEKLY = 2
-    FORTNIGHTLY = 3
-    MONTHLY = 4
-    BIWEEKLY = 5
+    BIWEEKLY = 3
+    FORTNIGHTLY = 4
+    MONTHLY = 5
+    ByDateInterval = 6
 
 class FinancialAreaEquivalenceDto(BaseModel):
     Id: int
@@ -817,14 +818,13 @@ def raw_originate_sms_gmt_fun(originateSmsDto):
             rows = []
             for keys, group in grouped:
                 rows.append({
-                    "VendorId": str(keys[0]),
                     "Vendor": keys[1],
                     "VendorProduct": keys[2],
                     "VendorCountry": keys[3],
                     "Network": keys[4],
                     "MccMnc": keys[5],
-                    "VendorCurrencyCode": keys[6],
                     "VendorRate": keys[7],
+                    "VendorCurrencyCode": keys[6],
                     "Messages": int(group["QuantityV"].sum()),
                     "VendorAmount": group["VendorAmount"].sum()
                 })
@@ -832,7 +832,7 @@ def raw_originate_sms_gmt_fun(originateSmsDto):
             df_output = pd.DataFrame(rows)
 
             filename = sanitize_filename(
-                f"GMT_RawOriginateSMS_{billingCycleId.name}_{gmtDates.StartDate.strftime('%Y%m%d')}_{gmtDates.EndDate.strftime('%Y%m%d')}.csv"
+                f"GMT_RawOriginateSMS_{BillingCycle(billingCycleId).name}_{gmtDates.StartDate.strftime('%Y%m%d')}_{gmtDates.EndDate.strftime('%Y%m%d')}.csv"
             )
             output_folder = "output"
             os.makedirs(output_folder, exist_ok=True)
