@@ -8,6 +8,7 @@ from typing import List, Dict, Optional
 import pandas as pd
 from core.db import get_engine
 from core.logger import init_log
+from core.oracle_connector import create_oracle_connection, output_type_handler
 from core.sharepoint import init_sharepoint, upload_sharepoint
 from core.email import send_email, init_email
 import core.config as cfg
@@ -20,21 +21,23 @@ import asyncio
 import uvicorn
 from enum import IntEnum
 import uuid
+import concurrent.futures
 
 
 global config, logger, interval_time, to_emails, to_emails_filtered_report, semaphore
 
-jobs: Dict[str, dict] = {}
 app = FastAPI()
 logger = init_log()
 
+process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count())
+jobs = {}
+semaphore = asyncio.Semaphore(5)
+
 
 def init():
-    global config, logger, interval_time, to_emails, to_emails_filtered_report, semaphore
+    global config, logger, interval_time, to_emails, to_emails_filtered_report
 
-    semaphore = asyncio.Semaphore(5)
     config = init_config()
-
     init_email()
     init_sharepoint()
     try:
@@ -64,27 +67,24 @@ async def log_requests(request: Request, call_next):
 
 def register_job(func, *args, **kwargs):
     job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "pending/queued", 
-                    "result": None, 
-                    "error": None,
-                    "request": {
-                            "function": func.__name__,
-                            "args": args,
-                        }
-                }
+    jobs[job_id] = {
+        "status": "pending/queued",
+        "result": None,
+        "error": None,
+        "request": {"function": func.__name__, "args": args},
+    }
 
     async def wrapper():
         async with semaphore:
             try:
                 jobs[job_id]["status"] = "running"
-                result = await asyncio.to_thread(func, *args, **kwargs)
 
-                if isinstance(result, dict) and "status_code" in result:
-                    jobs[job_id]["status"] = "done" if result["status_code"] == 200 else "error"
-                    jobs[job_id]["result"] = str(result)
-                else:
-                    jobs[job_id]["status"] = "done"
-                    jobs[job_id]["result"] = result
+                # Ejecutar la función en un proceso separado (usa otro núcleo)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(process_pool, func, *args, **kwargs)
+
+                jobs[job_id]["status"] = "done"
+                jobs[job_id]["result"] = result
 
             except Exception as e:
                 jobs[job_id]["status"] = "error"
@@ -94,7 +94,6 @@ def register_job(func, *args, **kwargs):
     loop = asyncio.get_event_loop()
     loop.create_task(wrapper())
     return job_id
-
 
 def sanitize_filename(filename: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', filename)
@@ -122,6 +121,10 @@ class BillingCycle(IntEnum):
     FORTNIGHTLY = 4
     MONTHLY = 5
     ByDateInterval = 6
+    
+class CurrencyID(IntEnum):
+    USD = 0
+    EUR = 1
 
 class FinancialAreaEquivalenceDto(BaseModel):
     Id: int
@@ -137,7 +140,7 @@ class ExcelImporterSmsDto:
     InvoiceNumber: str
     ItemCode: str
     Destination: str
-    Class_: str
+    Class: str
     Period: str
     CreationDate: str
     Terms: str
@@ -177,14 +180,23 @@ def calculate_dates_weekly(_: BillingCycleDateDto) -> BillingCycleDateDto:
     start = end - timedelta(days=7)
     return BillingCycleDateDto(StartDate=start, EndDate=end)
 
+def calculate_dates_biweekly(_: BillingCycleDateDto) -> BillingCycleDateDto:
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    end = today - timedelta(days=today.weekday())  # Monday
+    start = end - timedelta(days=14)
+    return BillingCycleDateDto(StartDate=start, EndDate=end)
+
 def calculate_dates_fortnightly() -> BillingCycleDateDto:
     today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    day = today.day
-    if day > 15:
+
+    if today.day > 15:
+        # Estamos en la segunda quincena → devolver la PRIMERA del mes actual
         start = today.replace(day=1)
         end = today.replace(day=16)
     else:
-        start = today.replace(day=16, month=today.month - 1)
+        # Estamos en la primera quincena → devolver la SEGUNDA del mes anterior
+        last_month = today - relativedelta(months=1)
+        start = last_month.replace(day=16)
         end = today.replace(day=1)
     return BillingCycleDateDto(StartDate=start, EndDate=end)
 
@@ -199,6 +211,8 @@ def calculate_query_dates_by_billing_cycle(answer_dto: BillingCycleDateDto, bill
         return set_dates_from_input(answer_dto.StartDate, answer_dto.EndDate)
     if billing_cycle_id == BillingCycle.WEEKLY:
         return calculate_dates_weekly(answer_dto)
+    if billing_cycle_id == BillingCycle.BIWEEKLY:
+        return calculate_dates_biweekly(answer_dto)
     if billing_cycle_id == BillingCycle.FORTNIGHTLY:
         return calculate_dates_fortnightly()
     if billing_cycle_id == BillingCycle.MONTHLY:
@@ -217,6 +231,23 @@ def fetch_carriers() -> pd.DataFrame:
     except Exception as ex:
         logger.exception("Error fetching Carriers data: %s", str(ex))
         return pd.DataFrame()
+
+
+def get_originate_reconciliation_by_period_sms(start_date: datetime, end_date: datetime, period: int) -> pd.DataFrame:
+    try:
+        engine = get_engine()
+        query = f'''select * from originateReconciliationSms
+                    where StartDateIdentidad >= '{start_date.strftime("%Y-%m-%d %H:%M:%S")}'
+                    and EndDateIdentidad <= '{end_date.strftime("%Y-%m-%d %H:%M:%S")}'
+                    and ({period} = -1 or BillingCycleId = {period} )'''
+        df = pd.read_sql(query, engine)
+        logger.info("Fetched carriers: %d rows", len(df))
+        return df
+    except Exception as ex:
+        logger.exception("Error fetching Carriers data: %s", str(ex))
+        return pd.DataFrame()
+
+
 
 def fetch_financial_area_equivalence() -> pd.DataFrame:
     try:
@@ -309,7 +340,7 @@ def raw_originate_sms_customGmt_fun(originateSmsDto):
         send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
         return {"status_code":500, "content":{"error": f"Error procesando reporte: {str(ex)}"}}
 
-def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, end_date: datetime, isAnswer: bool) -> pd.DataFrame:
+def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, end_date: datetime, isAnswer: bool, currency: str = None) -> pd.DataFrame:
     try:
         engine = get_engine()
         tuple_ids = ()
@@ -334,6 +365,9 @@ def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, 
             WHERE Date >= '{start_date.strftime("%Y-%m-%d %H:%M:%S")}' AND Date < '{end_date.strftime("%Y-%m-%d %H:%M:%S")}'
             AND {id_column} IN {tuple_ids}
         """
+        if currency:
+            query += f" AND {'ClientCurrencyCode' if isAnswer else 'VendorCurrencyCode'} = '{currency}'"
+
         with engine.connect() as conn:
             df = pd.read_sql(query, conn)
         logger.info("Fetched Answer/Originate SMS rows: %d", len(df))
@@ -381,23 +415,20 @@ def create_answer_importer_excel_dto(
         multi_currency = False if currency_info is None else not currency_info.Result
         if multi_currency:
             cur_code = answer_data.ClientCurrencyCode or ""
-            customer_value = f"{quickbox}_{cur_code.lower()}"
-        else:
-            customer_value = quickbox
+            customer_value = f"{quickbox}_{cur_code.upper()}"
 
-    # InvoiceNumber: si cambia Customer
     if answer_importer_sms_excel_dtos:
         last_customer = answer_importer_sms_excel_dtos[-1].Customer
         if last_customer != customer_value:
             answer_or_dto["InvoiceNumber"] += 1
 
-    period = f"{billing_cycle_date_dto.StartDate:%Y-%m-%d} to {(billing_cycle_date_dto.EndDate - timedelta(days=1)):%Y-%m-%d}"
-    creation_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    period = f"{billing_cycle_date_dto.StartDate:%m/%d/%Y} to {(billing_cycle_date_dto.EndDate - timedelta(days=1)):%m/%d/%Y}"
+    creation_date = (datetime.now() - timedelta(days=1)).strftime("%m/%d/%Y")
 
     if carrier is not None:
         terms_days = int(carrier.get("ClientPaymentTerms", 0) or 0)
         terms = f"{terms_days} DAYS"
-        due_date = (datetime.now() + timedelta(days=terms_days - 1 if terms_days > 0 else 0)).strftime("%Y-%m-%d")
+        due_date = (-timedelta(days=1) + billing_cycle_date_dto.EndDate + timedelta(days=terms_days - (1 if terms_days > 0 else 0))).strftime("%m/%d/%Y")
     else:
         terms = f"carrier no existe {answer_data.Client}"
         due_date = terms
@@ -406,11 +437,11 @@ def create_answer_importer_excel_dto(
     note = cfg.get_parameter("Answer", "AnswerFinancialNote")
 
     dto = ExcelImporterSmsDto(
-        Customer=customer_value,
+        Customer=f"{customer_value}_",
         InvoiceNumber="Insert Bill Number" if len(answer_importer_sms_excel_dtos) == 0 else f"=IF(A{len(answer_importer_sms_excel_dtos)+2} = A{len(answer_importer_sms_excel_dtos)+1}, B{len(answer_importer_sms_excel_dtos)+1},B{len(answer_importer_sms_excel_dtos)+1}+1)",
         ItemCode=financial["Item"] if financial is not None else answer_data.ClientCountry,
         Destination=financial["Name"] if financial is not None else answer_data.ClientCountry,
-        Class_=financial["Class"] if financial is not None else "DefaultFinancialClass",
+        Class=financial["Class"] if financial is not None else "DefaultFinancialClass",
         Period=period,
         CreationDate=creation_date,
         Terms=terms,
@@ -455,12 +486,46 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
                                          financial_area_equivalence_dto_list, answerImporterExcelDtos, list_clients)
 
     if answerImporterExcelDtos:
+        headers = [
+            "Customer",
+            "Invoice Number",
+            "Item Code",
+            "Destination",
+            "Class",
+            "Period From/To",
+            "Creation date",
+            "TERM",
+            "Due Date",
+            "Email Sent",
+            "Note",
+            "Rate",
+            "Messages"
+        ]
+
         df_importer = pd.DataFrame([dto.__dict__ for dto in answerImporterExcelDtos])
-        
+        df_importer.rename(columns={
+            "Customer": "Customer",
+            "InvoiceNumber": "Invoice Number",
+            "ItemCode": "Item Code",
+            "Destination": "Destination",
+            "Class": "Class",
+            "Period": "Period From/To",
+            "CreationDate": "Creation date",
+            "Terms": "TERM",
+            "DueDate": "Due Date",
+            "EmailSent": "Email Sent",
+            "Note": "Note",
+            "Rate": "Rate",
+            "Messages": "Messages"
+        }, inplace=True)
+
+        df_importer = df_importer[headers]
+
         if gmtCarriers:
-            report_name = f"AnswerImporter_forGMT{gmt}_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.xlsx"
+            report_name = f"AnswerSms__ForGMT{gmt}_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%m%d%Y%H%M}_{billingCycleDateDto.EndDate:%m%d%Y%H%M}.xlsx"
         else:
-            report_name = f"AnswerImporter_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.xlsx"
+            report_name = f"AnswerSms_{BillingCycle(billingCycleId).name}_{billingCycleDateDto.StartDate:%m%d%Y%H%M}_{billingCycleDateDto.EndDate:%m%d%Y%H%M}.xlsx"
+        
         output_path = os.path.join("output", report_name)
         os.makedirs("output", exist_ok=True)
         df_importer.to_excel(output_path, index=False)
@@ -468,7 +533,8 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
         logger.info("Raw Excel file generated at: %s", output_path) 
                 
         try: 
-            upload_sharepoint(output_path, report_name) 
+            print("----")
+            #upload_sharepoint(output_path, report_name) 
         except Exception: 
             logger.exception("Error uploading raw answer CSV to sharepoint")
 
@@ -481,7 +547,7 @@ def generate_answer_files(answerSmsDto):
             raise Exception("Not carriers found")
 
         for billing_cycle_id in answerSmsDto["ClientBillingCycleId"]:
-            billingCycleDateDto = calculate_query_dates_by_billing_cycle(answerSmsDto, billing_cycle_id)
+            billingCycleDateDto = calculate_query_dates_by_billing_cycle(answerSmsDto["billingCycleDate"], billing_cycle_id)
             financialAreaEquivalenceDtoList = fetch_financial_area_equivalence()
 
             data = fetch_AnswerOriginateSms_By_date_carrier(
@@ -499,8 +565,45 @@ def generate_answer_files(answerSmsDto):
                     ClientAmountUSD=("ClientAmountUSD", "sum"),
                 ).reset_index()
             )
+            
+            grouped_ = grouped.copy()
 
-            # Convertir a DTOs
+            carrier_map = dict(
+                zip(carrier_list["CarrierId"].astype(str), carrier_list["ClientQuickBoxName"])
+            )
+
+            # Aplicamos la lógica C# con pandas apply
+            grouped["Client"] = grouped.apply(
+                lambda row: (
+                    f"{carrier_map.get(str(row['ClientId']))}_{row['ClientCurrencyCode']}"
+                    if str(row["ClientId"]) in carrier_map
+                    else row["Client"]
+                ),
+                axis=1,
+            )
+
+            grouped.rename(columns={
+                    "ClientNet": "Network",
+                    "ClientMccMnc": "MccMnc",
+                    "QuantityC": "Messages"
+            }, inplace=True)
+
+            columns_order = [
+                "Client",
+                "ClientProduct",
+                "ClientCountry",
+                "Network",
+                "MccMnc",
+                "ClientRate",
+                "Messages",
+                "ClientAmount",
+                "ClientCurrencyCode",
+                "ClientAmountUSD"
+            ]
+
+            grouped = grouped[columns_order]
+
+
             grouped_data = [
                 AnswerOriginateSmsDto(
                     ClientId=int(row["ClientId"]) if row["ClientId"] else None,
@@ -515,7 +618,7 @@ def generate_answer_files(answerSmsDto):
                     ClientAmount=row["ClientAmount"],
                     ClientAmountUSD=row["ClientAmountUSD"],
                 )
-                for _, row in grouped.iterrows()
+                for _, row in grouped_.iterrows()
                 if row["QuantityC"] > 0
             ]
 
@@ -535,9 +638,8 @@ def generate_answer_files(answerSmsDto):
             except Exception: 
                 logger.exception("Error uploading raw answer CSV to sharepoint")
 
-            # ListClients (moneda única/múltiple)
             list_clients = (
-                pd.DataFrame(grouped)
+                pd.DataFrame(grouped_)
                 .groupby("ClientId")["ClientCurrencyCode"]
                 .nunique()
                 .reset_index()
@@ -924,7 +1026,7 @@ def raw_originate_sms_fun(originateSmsDto):
         return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
 
 
-@app.get("/")
+@app.get("/api")
 async def email_test():
     try:
         send_email(to_emails, "test email to_emails", "test email to_emails")
@@ -996,7 +1098,7 @@ async def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, bil
     return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
 
 @app.post("/api/sms/RawAnswerSm/MonthlyEdrs")
-async def get_answer_sms_get_monthly(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
+async def get_answer_sms_monthly(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
     
     answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "VendorBillingCycleId": [int(billing_cycle)], 
@@ -1004,6 +1106,575 @@ async def get_answer_sms_get_monthly(billingCycleDate: BillingCycleDateDto, bill
                   "billingCycleDate": billingCycleDate}
     
     job_id = register_job(get_answer_sms_get_monthly_fun, answer_dto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+def get_alaris_active_carrier():
+    try:
+        oracle_connection = create_oracle_connection()
+        with oracle_connection as conn:
+            cursor = conn.cursor()
+
+            query = """select      
+            bc.CAR_ID, bc.CAR_NAME, ba.ACC_CURRENCY_CODE
+            from        invoice.BAS_CARRIER bc
+            inner join  invoice.bas_account ba
+            ON ba.ACC_CAR_ID = bc.CAR_ID
+            where bc.CAR_IS_ACTIVE = 1 order by bc.CAR_ID asc"""
+
+            cursor.execute(query)
+
+            cursor.rowfactory = lambda *args: dict(
+                zip([d[0] for d in cursor.description], args)
+            )
+            data = cursor.fetchall()
+        return data
+    except Exception as ex:
+        logger.warning("Failed try to get carriers from Alaris: %s", str(ex))
+        return pd.DataFrame(columns=["CAR_ID"])
+
+def cross_data(data_answer_sum, data_orig_sum, carrier_list, billing_cycle_id, 
+               billing_cycle_dates, is_gmt, currency, list_originates_reconciliation=None):
+
+    # Convertir listas de dict a DataFrames si no lo son
+    df_answer = pd.DataFrame(data_answer_sum)
+    df_orig = pd.DataFrame(data_orig_sum)
+    df_carriers = pd.DataFrame(carrier_list)
+
+    cross_weekly, cross_fornightly, cross_monthly = [], [], []
+
+    # --- Aplicar QuickBoxName a cada registro de cross_* ---
+    def apply_quickbox_name(cross_list):
+        for rec in cross_list:
+            carrier_id = rec.get("CarrierId")
+            match = df_carriers[df_carriers["CarrierId"] == carrier_id]
+            if not match.empty:
+                rec["CarrierName"] = match.iloc[0]["QuickBoxName"]
+        return cross_list
+
+    # --- Unir Answer con Originate por CarrierId ---
+    merged = pd.merge(
+        df_answer, df_orig, on="CarrierId", how="outer", suffixes=("_Answer", "_Originate")
+    ).fillna(0)
+
+    # --- Combinar precios de ambas fuentes ---
+    for _, row in merged.iterrows():
+        carrier_id = row["CarrierId"]
+        carrier_name = row.get("Client", "") or row.get("Vendor", "")
+        client_price = row.get("TotalPrice_Answer", 0)
+        vendor_price = row.get("TotalPrice_Originate", 0)
+
+        carrier = df_carriers[df_carriers["CarrierId"] == carrier_id]
+        
+        if carrier.empty:
+            continue
+
+        cycle = int(carrier["ClientBillingCycleId"].iloc[0]) if not pd.isna(carrier["ClientBillingCycleId"].iloc[0]) else 0
+        record = {
+            "CarrierId": carrier_id,
+            "CarrierName": carrier_name,
+            "ClientPrice": client_price,
+            "VendorPrice": vendor_price,
+        }
+
+        if cycle == 2:
+            cross_weekly.append(record)
+        elif cycle == 4:
+            cross_fornightly.append(record)
+        elif cycle == 5:
+            cross_monthly.append(record)
+
+    for _, row in df_carriers.iterrows():
+        cid, name, cb, vb = row["CarrierId"], row.get("Name", ""), row.get("ClientBillingCycleId"), row.get("VendorBillingCycleId")
+        empty = {"CarrierId": cid, "CarrierName": name, "ClientPrice": 0, "VendorPrice": 0}
+        if cb == 2 or vb == 2:
+            if cid not in [x["CarrierId"] for x in cross_weekly]:
+                cross_weekly.append(empty)
+        if cb == 4 or vb == 4:
+            if cid not in [x["CarrierId"] for x in cross_fornightly]:
+                cross_fornightly.append(empty)
+        if cb == 5 or vb == 5:
+            if cid not in [x["CarrierId"] for x in cross_monthly]:
+                cross_monthly.append(empty)
+
+    def group_report(data, head_first=""):
+        df = pd.DataFrame(data)
+
+        if df.empty:
+            return df
+
+        # 🔹 Asegurar que todas las columnas relevantes existan
+        for col in ["CarrierName", "ClientPrice", "VendorPrice"]:
+            if col not in df.columns:
+                df[col] = 0
+
+        # 🔹 Convertir tipos para evitar errores de comparación y suma
+        df["CarrierName"] = df["CarrierName"].astype(str).fillna("")
+        df["ClientPrice"] = pd.to_numeric(df["ClientPrice"], errors="coerce").fillna(0)
+        df["VendorPrice"] = pd.to_numeric(df["VendorPrice"], errors="coerce").fillna(0)
+
+        # 🔹 Agrupar y ordenar de forma segura (ignorando mayúsculas/minúsculas)
+        df = (
+            df.groupby(["CarrierName"], as_index=False)
+            .agg(ClientPrice=("ClientPrice", "sum"), VendorPrice=("VendorPrice", "sum"))
+            .sort_values("CarrierName", key=lambda s: s.str.lower())
+        )
+
+        return df
+
+    # cross_weekly = apply_quickbox_name(cross_weekly)
+    # cross_fornightly = apply_quickbox_name(cross_fornightly)
+    # cross_monthly = apply_quickbox_name(cross_monthly)
+
+    cross_weekly = group_report(cross_weekly, head_first="Weekly")
+    cross_fornightly = group_report(cross_fornightly, head_first="Fortnightly")
+    cross_monthly = group_report(cross_monthly, head_first="Monthly")
+
+    # --- Integrar conciliación (si aplica) ---
+    if list_originates_reconciliation is not None:
+        # Convertir a DataFrame si viene como lista
+        if isinstance(list_originates_reconciliation, list):
+            df_recon = pd.DataFrame(list_originates_reconciliation)
+        elif isinstance(list_originates_reconciliation, pd.DataFrame):
+            df_recon = list_originates_reconciliation.copy()
+        else:
+            df_recon = pd.DataFrame()
+
+        if not df_recon.empty:
+            for df_cross in [cross_weekly, cross_fornightly, cross_monthly]:
+                for idx, row in df_cross.iterrows():
+                    name = row["CarrierName"]
+                    matches = df_recon[df_recon["Vendor"] == name]
+                    if not matches.empty:
+                        cost_usd = pd.to_numeric(matches["CostUSD"], errors="coerce").sum()
+                        if cost_usd != 0:
+                            df_cross.loc[idx, "VendorPrice"] = cost_usd
+
+    
+    # --- Calcular diferencia ---
+    def calculate_difference(df):
+        if df.empty:
+            return df
+        df["Difference"] = df["ClientPrice"] - df["VendorPrice"]
+        return df
+
+    cross_weekly = calculate_difference(cross_weekly)
+    cross_fornightly = calculate_difference(cross_fornightly)
+    cross_monthly = calculate_difference(cross_monthly)
+
+    def generate_data(client_list, vendor_list, cross_data):
+        for crossed in cross_data:
+            carrier_name = crossed.get("CarrierName", "")
+            diff = crossed.get("Difference", 0) or 0
+            if diff < 0:
+                vendor_list.append({"Carrier": carrier_name, "Difference": abs(diff)})
+                client_list.append({"Carrier": carrier_name, "Difference": 0})
+            elif diff > 0:
+                client_list.append({"Carrier": carrier_name, "Difference": abs(diff)})
+                vendor_list.append({"Carrier": carrier_name, "Difference": 0})
+            else:
+                empty = {"Carrier": carrier_name, "Difference": 0}
+                client_list.append(empty)
+                vendor_list.append(empty)
+
+    # --- Generar listas finales ---
+    client_final_weekly, vendor_final_weekly = [], []
+    generate_data(client_final_weekly, vendor_final_weekly, cross_weekly.to_dict(orient="records"))
+
+    client_final_fornightly, vendor_final_fornightly = [], []
+    generate_data(client_final_fornightly, vendor_final_fornightly, cross_fornightly.to_dict(orient="records"))
+
+    client_final_monthly, vendor_final_monthly = [], []
+    generate_data(client_final_monthly, vendor_final_monthly, cross_monthly.to_dict(orient="records"))
+
+    # --- Crear archivo Excel final ---
+    filename = (
+        f"{'GMT_' if is_gmt else ''}Provisionales_sms_{currency}_{billing_cycle_dates.StartDate:%Y%m%d}_{billing_cycle_dates.EndDate:%Y%m%d}.xlsx"
+    )
+    date_cicle=f"_{billing_cycle_dates.StartDate:%Y%m%d}_{billing_cycle_dates.EndDate:%Y%m%d}"
+    output_dir = "output"
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+        cross_weekly.to_excel(writer, sheet_name=f"Weekly"[:31], index=False)
+        pd.DataFrame(client_final_weekly).to_excel(writer, sheet_name=f"ClientWeekly{date_cicle}"[:31], index=False)
+        pd.DataFrame(vendor_final_weekly).to_excel(writer, sheet_name=f"VendorWeekly{date_cicle}"[:31], index=False)
+        cross_fornightly.to_excel(writer, sheet_name=f"Fornightly"[:31], index=False)
+        pd.DataFrame(client_final_fornightly).to_excel(writer, sheet_name=f"ClientFornightly{date_cicle}"[:31], index=False)
+        pd.DataFrame(vendor_final_fornightly).to_excel(writer, sheet_name=f"VendorFornightly{date_cicle}"[:31], index=False)
+        cross_monthly.to_excel(writer, sheet_name=f"Monthly"[:31], index=False)
+        pd.DataFrame(client_final_monthly).to_excel(writer, sheet_name=f"ClientMonthly{date_cicle}"[:31], index=False)
+        pd.DataFrame(vendor_final_monthly).to_excel(writer, sheet_name=f"VendorMonthly{date_cicle}"[:31], index=False)
+
+    logger.info(filename, " Excel generated at: %s", output_path)
+    try:
+        upload_sharepoint(output_path, filename)
+    except Exception as ex:
+        logger.warning("SharePoint upload failed: %s", str(ex))
+
+    return output_path
+
+def get_provisionals_sms_fun(model: dict, is_gmt: bool):
+    message = ""
+
+    try:
+        df_carriers = fetch_carriers()
+        if df_carriers.empty:
+            raise Exception("Not Found Carriers in Apollo")
+
+        for billing_cycle_id in model["ClientBillingCycleId"]:
+            if not is_gmt:
+                carrier_list = df_carriers[
+                    df_carriers["Currency"].str.contains(CurrencyID(model["currency_ID"]).name, na=False)]
+            else:
+                if billing_cycle_id != 6:
+                    carrier_list = df_carriers[
+                        (df_carriers["ClientBillingCycleId"] == billing_cycle_id)
+                        & (df_carriers["IsGMT"] == True)
+                    ]
+                else:
+                    carrier_list = df_carriers[
+                        (df_carriers["ClientBillingCycleId"] == model["CarrierBillingPeriod"])
+                        & (df_carriers["IsGMT"] == True)
+                    ]
+
+
+            if carrier_list.empty:
+                logger.warning(f"No carriers found for billingCycleId {billing_cycle_id}")
+                continue
+
+            # --- Calcular fechas ---
+            billing_cycle_dates = calculate_query_dates_by_billing_cycle(model["billingCycleDate"], billing_cycle_id)
+
+            # --- Obtener Answer y Originate ---
+            df_answer = fetch_AnswerOriginateSms_By_date_carrier(
+                carrier_list, billing_cycle_dates.StartDate, billing_cycle_dates.EndDate, isAnswer=True
+            )
+            df_orig = fetch_AnswerOriginateSms_By_date_carrier(
+                carrier_list, billing_cycle_dates.StartDate, billing_cycle_dates.EndDate, isAnswer=False
+            )
+
+            if df_answer.empty and df_orig.empty:
+                logger.warning("No data found for the selected period")
+                continue
+
+            currency_code = CurrencyID(model["currency_ID"]).name 
+
+            if not df_answer.empty: 
+                df_answer = df_answer[ (df_answer["QuantityC"] > 0) 
+                                      & (df_answer["ClientCurrencyCode"].fillna("") == currency_code) ] 
+                df_answer["CarrierId"] = df_answer["ClientId"].astype(str) 
+                df_answer["Client"] = df_answer["Client"].fillna("")
+                df_answer_sum = ( df_answer.groupby(["CarrierId", "Client"], 
+                                                    dropna=False).agg(TotalMessages=("QuantityC", "sum"), 
+                                                                      TotalPrice=("ClientAmount", "sum")) .reset_index() ) 
+            else: 
+                df_answer_sum = pd.DataFrame(columns=["CarrierId", "Client", "TotalMessages", "TotalPrice"])
+ 
+            if not df_orig.empty:
+                df_orig = df_orig[
+                    (df_orig["QuantityV"] > 0)
+                    & (df_orig["VendorCurrencyCode"].fillna("") == currency_code)
+                ]
+                df_orig["CarrierId"] = df_orig["VendorId"].astype(str)
+                df_orig["Vendor"] = df_orig["Vendor"].fillna("")
+                df_orig_sum = (
+                    df_orig.groupby(["CarrierId", "Vendor"], dropna=False)
+                    .agg(TotalMessages=("QuantityV", "sum"), TotalPrice=("VendorAmount", "sum"))
+                    .reset_index()
+                )
+            else:
+                df_orig_sum = pd.DataFrame(columns=["CarrierId", "Vendor", "TotalMessages", "TotalPrice"])
+
+            
+            output_path = cross_data(
+                df_answer_sum.to_dict(orient="records"),
+                df_orig_sum.to_dict(orient="records"),
+                carrier_list.to_dict(orient="records"),
+                billing_cycle_id,
+                billing_cycle_dates,
+                is_gmt,
+                currency_code,
+            )
+
+            logger.info("CrossReport generated and saved at: %s", output_path)
+
+        return {"content": {"message": "CrossReport completed successfully"}, "status_code": 200}
+
+    except Exception as ex:
+        message = f"Error generating CrossReport: {str(ex)}"
+        logger.exception(message)
+        send_email(to_emails, "Error CrossReport", message)
+        return {"status_code": 500, "content": {"error": message}}
+    
+@app.post("/api/sms/Provisionals")
+async def get_provisionals_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, currency_ID: CurrencyID):
+    provisionals_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate,
+                  "currency_ID": currency_ID}
+    
+    job_id = register_job(get_provisionals_sms_fun, provisionals_dto, False)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+
+def get_provisionals_sms_GMT_fun(model: dict, is_gmt: bool):
+    try:
+        message = ""
+
+        # Calcular fechas del ciclo de facturación
+        billing_cycle_dates = calculate_query_dates_by_billing_cycle(
+            model["billingCycleDate"],
+            model["ClientBillingCycleId"][0]
+        )
+
+        for billing_cycle_id in model["ClientBillingCycleId"]:
+            data_answer_sum = []
+            data_originate_sum = []
+
+            # Obtener carriers activos de Alaris
+            alaris_active = get_alaris_active_carrier()
+            if isinstance(alaris_active, pd.DataFrame):
+                active_ids = alaris_active["CAR_ID"].astype(str).tolist()
+            else:
+                active_ids = [str(x.get("CAR_ID")) for x in alaris_active] if alaris_active else []
+            if not active_ids:
+                raise Exception("Not Found Active Carriers in Alaris")
+
+            df_carriers = fetch_carriers()
+            if isinstance(df_carriers, pd.DataFrame):
+                df_carriers_ap_ac = df_carriers["CarrierId"].astype(str).tolist()
+            else:
+                df_carriers_ap_ac = [str(x.get("CarrierId")) for x in df_carriers] if df_carriers else []
+            if not df_carriers_ap_ac:
+                raise Exception("Not Found Active Carriers in Alaris")
+
+            currency = CurrencyID(model["currency_ID"]).name
+
+            if "DIDs" not in currency:
+                carrier_list_no_gmt = df_carriers[
+                    (~df_carriers["IsGMT"]) &
+                    (df_carriers["Currency"].fillna("").str.contains(currency.replace("DIDs", ""), case=False)) &
+                    (~df_carriers["Name"].str.lower().str.endswith("did"))
+                ]
+                carrier_list_gmt = df_carriers[
+                    (df_carriers["IsGMT"]) &
+                    (df_carriers["Currency"].fillna("").str.contains(currency.replace("DIDs", ""), case=False)) &
+                    (~df_carriers["Name"].str.lower().str.endswith("did"))
+                ]
+            else:
+                carrier_list_no_gmt = df_carriers[
+                    (~df_carriers["IsGMT"]) &
+                    (df_carriers["Currency"].fillna("").str.contains(currency.replace("DIDs", ""), case=False)) &
+                    (df_carriers["Name"].str.lower().str.endswith("did"))
+                ]
+                carrier_list_gmt = df_carriers[
+                    (df_carriers["IsGMT"]) &
+                    (df_carriers["Currency"].fillna("").str.contains(currency.replace("DIDs", ""), case=False)) &
+                    (df_carriers["Name"].str.lower().str.endswith("did"))
+                ]
+
+            carrier_list = pd.concat([carrier_list_no_gmt, carrier_list_gmt])
+            if carrier_list.empty:
+                raise Exception("Not Found Carriers in Apollo (no match for filters)")
+
+            def apply_quickbox_name(cross_list, df_carriers):
+                # Crear un diccionario CarrierId -> QuickBoxName
+                carrier_map = df_carriers.set_index("CarrierId")["VendorQuickBoxName"].to_dict()
+
+                for rec in cross_list:
+                    carrier_id = rec.get("CarrierId")
+                    # Si existe QuickBoxName para ese carrier, úsalo
+                    if carrier_id in carrier_map:
+                        rec["Client"] = carrier_map[carrier_id] if carrier_map[carrier_id] != "" else rec["Client"]
+                    else:
+                        # Valor por defecto si no hay coincidencia
+                        rec["Client"] = rec.get("Client", rec["Client"])
+                return cross_list
+
+            def process_answer():
+                df_answer_no_gmt = fetch_AnswerOriginateSms_By_date_carrier(
+                    carrier_list_no_gmt, billing_cycle_dates.StartDate, billing_cycle_dates.EndDate, isAnswer=True, currency=currency)
+                
+                all_answer = [df_answer_no_gmt]
+
+                for gmt_value, carr in carrier_list_gmt.groupby("CustomGMT"):
+                    miami_tz = pytz.timezone("America/New_York")
+                    tz_offset = miami_tz.utcoffset(datetime.now()).total_seconds() / 3600
+
+                    # Calcular la diferencia de horas según el GMT del carrier
+                    custom_span = tz_offset if gmt_value == 0 else tz_offset - gmt_value
+
+                    start = billing_cycle_dates.StartDate + timedelta(hours=custom_span)
+                    end = billing_cycle_dates.EndDate + timedelta(hours=custom_span)
+
+                    df_custom = fetch_AnswerOriginateSms_By_date_carrier(carr, start, end, isAnswer=True, currency=currency)
+                    all_answer.append(df_custom)
+
+                df_answer = pd.concat(all_answer, ignore_index=True) 
+                if df_answer.empty:
+                    return pd.DataFrame()
+
+                df_answer = df_answer[
+                    (df_answer["ClientId"].astype(str).isin(active_ids)) | ((df_answer["QuantityC"] > 0) )]
+
+                df_answer = df_answer[
+                    (df_answer["ClientCurrencyCode"] == currency) &
+                    (df_answer["ClientCurrencyCode"].notna())
+                ]
+
+                df_answer["CarrierId"] = df_answer["ClientId"].astype(str)
+                df_answer["Client"] = df_answer["Client"].fillna("")
+
+                df_answer = pd.DataFrame(apply_quickbox_name(df_answer.to_dict(orient="records"), carrier_list))
+
+                df_answer_sum = (
+                    df_answer.groupby(["CarrierId", "Client"], dropna=False)
+                    .agg(TotalMessages=("QuantityC", "sum"), TotalPrice=("ClientAmount", "sum"))
+                    .reset_index()
+                )
+                return df_answer_sum
+
+            def process_originate():
+                all_orig = []
+
+                for gmt_value, carr in carrier_list.groupby("CustomGMT"):
+
+                    miami_tz = pytz.timezone("America/New_York")
+                    tz_offset = miami_tz.utcoffset(datetime.now()).total_seconds() / 3600
+                    custom_span = tz_offset if gmt_value == 0 else tz_offset - gmt_value
+
+                    
+                    start = billing_cycle_dates.StartDate + timedelta(hours=custom_span)
+                    end = billing_cycle_dates.EndDate + timedelta(hours=custom_span)
+                    
+                    df_custom = fetch_AnswerOriginateSms_By_date_carrier(carr, start, end, isAnswer=False, currency=currency)
+                    all_orig.append(df_custom)
+
+                df_orig = pd.concat(all_orig, ignore_index=True) 
+                if df_orig.empty:
+                    return pd.DataFrame()
+
+                df_orig = df_orig[
+                    (df_orig["VendorId"].astype(str).isin(active_ids)) | ((df_orig["QuantityV"] > 0) )]
+
+                df_orig = df_orig[
+                    (df_orig["VendorCurrencyCode"] == currency) &
+                    (df_orig["VendorCurrencyCode"].notna())
+                ]
+                df_orig["CarrierId"] = df_orig["VendorId"].astype(str)
+                df_orig["Vendor"] = df_orig["Vendor"].fillna("")
+
+                df_orig = pd.DataFrame(apply_quickbox_name(df_orig.to_dict(orient="records"), carrier_list))
+
+                df_orig_sum = (
+                    df_orig.groupby(["CarrierId", "Vendor"], dropna=False)
+                    .agg(TotalMessages=("QuantityV", "sum"), TotalPrice=("VendorAmount", "sum"))
+                    .reset_index()
+                )
+                return df_orig_sum
+
+            data_answer_sum = process_answer()
+            data_originate_sum = process_originate()
+
+            if data_answer_sum.empty and data_originate_sum.empty:
+                logger.warning("No data found for the given cycle")
+                continue
+
+            data_ans_carrier = data_answer_sum["CarrierId"].astype(str).tolist()
+            data_orig_carrier = data_originate_sum["CarrierId"].astype(str).tolist()
+
+            filtered_carriers = [
+                w for w in carrier_list.to_dict(orient="records")
+                if (
+                    ((currency and currency in str(w.get("Currency", ""))) or not currency)
+                    # Validar que esté activo o en alguna lista
+                    and (
+                        w.get("CarrierId") in active_ids
+                        or w.get("CarrierId") in data_ans_carrier
+                        or w.get("CarrierId") in data_orig_carrier
+                    )
+                )
+            ]
+
+            null_carriers_answer = []
+            null_carrier_originate = []
+
+            # carrier_list puede ser DataFrame o lista de dicts — normalizamos a DataFrame para la validación
+            if not isinstance(carrier_list, pd.DataFrame):
+                try:
+                    carrier_list_df = pd.DataFrame(carrier_list)
+                except Exception:
+                    carrier_list_df = pd.DataFrame()
+            else:
+                carrier_list_df = carrier_list.copy()
+
+            # Solo validar si existen las columnas esperadas
+            if not carrier_list_df.empty:
+                if "ClientBillingCycleId" in carrier_list_df.columns:
+                    null_carriers_answer = carrier_list_df[
+                        carrier_list_df["ClientBillingCycleId"].isna() &
+                        carrier_list_df["CarrierId"].astype(str).isin(data_ans_carrier)
+                    ]["CarrierId"].astype(str).tolist()
+                if "VendorBillingCycleId" in carrier_list_df.columns:
+                    null_carrier_originate = carrier_list_df[
+                        carrier_list_df["VendorBillingCycleId"].isna() &
+                        carrier_list_df["CarrierId"].astype(str).isin(data_orig_carrier)
+                    ]["CarrierId"].astype(str).tolist()
+
+            # Si hay carriers sin ciclo, levantar excepción (mismo mensaje que el C#)
+            if null_carriers_answer or null_carrier_originate:
+                message = (
+                    f"Couldn't find billing cycles for the next contractor id's for answer: "
+                    f"{','.join(null_carriers_answer)}, "
+                    f"and the next contractor id's for originate: {','.join(null_carrier_originate)}."
+                )
+                raise Exception(message)
+
+            period = -1
+            listOriginatesReconciliation = get_originate_reconciliation_by_period_sms(start_date=billing_cycle_dates.StartDate, 
+                                                                                      end_date=billing_cycle_dates.EndDate, period=period)
+
+            if not isinstance(listOriginatesReconciliation, pd.DataFrame):
+                listOriginatesReconciliation = pd.DataFrame(listOriginatesReconciliation)
+
+            filtered_reconciliation = listOriginatesReconciliation[
+                listOriginatesReconciliation["VendorCurrencyCode"] == currency
+        ]
+
+            # Ejecutar conciliación cruzada
+            output_path = cross_data(
+                data_answer_sum.to_dict(orient="records"),
+                data_originate_sum.to_dict(orient="records"),
+                filtered_carriers,
+                billing_cycle_id,
+                billing_cycle_dates,
+                is_gmt,
+                currency,
+                filtered_reconciliation
+            )
+
+            logger.info(f"CrossReport Excel generated at: {output_path}")
+
+        logger.info("---- CrossReport_Reconciliation completed ----")
+        return {"content": {"message": "CrossReport Reconciliation completed successfully"}, "status_code": 200}
+
+    except Exception as ex:
+        message = f"Error generating CrossReport_Reconciliation: {str(ex)}"
+        logger.exception(message)
+        send_email(to_emails, "Error CrossReport_Reconciliation", message)
+        return {"status_code": 500, "content": {"error": message}}
+
+@app.post("/api/sms/Provisionals/GMT")
+async def get_provisionals_sms_GMT(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, currency_ID: CurrencyID):
+    provisionals_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate,
+                  "currency_ID": currency_ID}
+    
+    job_id = register_job(get_provisionals_sms_GMT_fun, provisionals_dto, True)
     return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
 
 
@@ -1020,3 +1691,16 @@ if __name__ == "__main__":
     )
 
 # Para ejecutar: uvicorn main:app --port 8001 --reload
+
+'''
+calcula el biling cycle date
+recorre el billing cycle id
+determina el periodo con base a las fechas, si es mes fortnight o week
+trae la lista de carriers de alaris
+valida que el currency sea diferente de DIDs, si lo es valida si GMT es false/true con lo que divide los que tienen GMT desde apollo
+crea una lista de carriers con ambos resultados -> carrierList
+genera la consulta de answer/originate por carrier y ajusta las fechas si es carrier GMT
+valida que la lista answer/originate no este vacia y que los carrierID existan en alaris o que la cantidad sea mayor a 0
+!!!!!!! recorre la la lista de answer/originate para obtener el VendorQuickBoxName de la lista carrierList y lo asigna al campo Client del answer/originate
+genera la agrupacion por cliente/venedor y carrierid sumando cantidad y precio
+'''
