@@ -91,8 +91,9 @@ def register_job(func, *args, **kwargs):
                 jobs[job_id]["error"] = str(e)
                 logger.exception(f"Error ejecutando job {job_id} ({func.__name__})")
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(wrapper())
+    #loop = asyncio.get_event_loop()
+    #loop.create_task(wrapper())
+    asyncio.create_task(wrapper())
     return job_id
 
 def sanitize_filename(filename: str) -> str:
@@ -157,11 +158,11 @@ class AnswerOriginateSmsDto:
     Client: Optional[str]
     ClientProduct: Optional[str]
     ClientCountry: Optional[str]
-    ClientNet: Optional[str]
-    ClientMccMnc: Optional[str]
+    Network: Optional[str]
+    MccMnc: Optional[str]
     ClientCurrencyCode: Optional[str]
     ClientRate: Optional[float]
-    QuantityC: int
+    Messages: int
     ClientAmount: Optional[float]
     ClientAmountUSD: Optional[float]
 
@@ -307,24 +308,23 @@ def raw_originate_sms_customGmt_fun(originateSmsDto):
             sum_amount_usd = group["VendorAmountUSD"].sum()
             carrier_info = df_carriers[df_carriers["CarrierId"].astype(str) == str(keys[0])]
             quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
-
+            custom_gmt_ = carrier_info["CustomGMT"].values[0] if not carrier_info.empty and "CustomGMT" in carrier_info.columns else None
             rows.append({
-                "VendorId": str(keys[0]),
-                "Vendor": keys[1],
+                "Vendor": f"{quickbox_name}_{keys[6]}" if quickbox_name else f"{keys[1]}_{keys[6]}",
                 "VendorProduct": keys[2],
                 "VendorCountry": keys[3],
                 "Network": keys[4],
                 "MccMnc": keys[5],
-                "VendorCurrencyCode": keys[6],
                 "VendorRate": keys[7],
                 "Messages": int(sum_quantity),
                 "VendorAmount": sum_amount,
-                "VendorAmountUSD": sum_amount_usd,
-                "VendorQuickBoxName": quickbox_name
+                "VendorCurrencyCode": keys[6],
+                "Custom GMT": custom_gmt_,
+                "VendorAmountUSD": sum_amount_usd
             })
 
         df_output = pd.DataFrame(rows)
-        filename = sanitize_filename(f"RawOriginateSMS_CustomGMT_{BillingCycle(originateSmsDto['VendorBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
+        filename = sanitize_filename(f"CustomGMT_OriginateSMS_{BillingCycle(originateSmsDto['VendorBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%m%d%Y%H%M')}_{(billingCycleDate.EndDate - timedelta(days=1)).strftime('%m%d%Y%H%M')}.CSV")
         output_folder = "output"
         os.makedirs(output_folder, exist_ok=True)
         output_path = os.path.join(output_folder, filename)
@@ -408,14 +408,18 @@ def create_answer_importer_excel_dto(
 
     currency_info = next((c for c in list_clients if c.ClientId == answer_data.ClientId), None)
 
+    customer_value= ""
+    
     if carrier is None:
         customer_value = f"carrier no existe {answer_data.Client}"
     else:
         quickbox = carrier.get("ClientQuickBoxName") or f"Nombre Quickbox no existe {carrier.get('Name')}"
         multi_currency = False if currency_info is None else not currency_info.Result
-        if multi_currency:
+        if not multi_currency:
             cur_code = answer_data.ClientCurrencyCode or ""
-            customer_value = f"{quickbox}_{cur_code.upper()}"
+            customer_value = f"{quickbox.strip()}_{cur_code.strip().upper()}"
+        else:
+            customer_value = f"{quickbox.strip()}"    
 
     if answer_importer_sms_excel_dtos:
         last_customer = answer_importer_sms_excel_dtos[-1].Customer
@@ -437,7 +441,7 @@ def create_answer_importer_excel_dto(
     note = cfg.get_parameter("Answer", "AnswerFinancialNote")
 
     dto = ExcelImporterSmsDto(
-        Customer=f"{customer_value}_",
+        Customer=customer_value, ################
         InvoiceNumber="Insert Bill Number" if len(answer_importer_sms_excel_dtos) == 0 else f"=IF(A{len(answer_importer_sms_excel_dtos)+2} = A{len(answer_importer_sms_excel_dtos)+1}, B{len(answer_importer_sms_excel_dtos)+1},B{len(answer_importer_sms_excel_dtos)+1}+1)",
         ItemCode=financial["Item"] if financial is not None else answer_data.ClientCountry,
         Destination=financial["Name"] if financial is not None else answer_data.ClientCountry,
@@ -449,8 +453,8 @@ def create_answer_importer_excel_dto(
         EmailSent=email_sent,
         Note=note,
         Rate=safe_float(answer_data.ClientRate),
-        Messages=safe_float(answer_data.QuantityC),
-        Amount=safe_float(answer_data.ClientRate) * safe_float(answer_data.QuantityC)
+        Messages=safe_float(answer_data.Messages),
+        Amount=safe_float(answer_data.ClientRate) * safe_float(answer_data.Messages)
     )
 
     answer_importer_sms_excel_dtos.append(dto)
@@ -464,7 +468,7 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
             ~carrier_list["ClientBillingCycleId"].fillna(0).astype(int).isin(answerOrDto["ClientBillingCycleId"])
         ]
 
-        print(invalid_carriers[["CarrierId", "Name", "ClientBillingCycleId"]].head(20))
+        #print(invalid_carriers[["CarrierId", "Name", "ClientBillingCycleId"]].head(20))
         
         for carrier_id in invalid_carriers["CarrierId"].astype(str).tolist():
             data = [d for d in data if d.ClientId not in (None, 0, int(carrier_id))]
@@ -533,8 +537,7 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
         logger.info("Raw Excel file generated at: %s", output_path) 
                 
         try: 
-            print("----")
-            #upload_sharepoint(output_path, report_name) 
+            upload_sharepoint(output_path, report_name) 
         except Exception: 
             logger.exception("Error uploading raw answer CSV to sharepoint")
 
@@ -572,7 +575,7 @@ def generate_answer_files(answerSmsDto):
                 zip(carrier_list["CarrierId"].astype(str), carrier_list["ClientQuickBoxName"])
             )
 
-            # Aplicamos la lógica C# con pandas apply
+
             grouped["Client"] = grouped.apply(
                 lambda row: (
                     f"{carrier_map.get(str(row['ClientId']))}_{row['ClientCurrencyCode']}"
@@ -610,11 +613,11 @@ def generate_answer_files(answerSmsDto):
                     Client=row["Client"],
                     ClientProduct=row["ClientProduct"],
                     ClientCountry=row["ClientCountry"],
-                    ClientNet=row["ClientNet"],
-                    ClientMccMnc=row["ClientMccMnc"],
+                    Network=row["ClientNet"],
+                    MccMnc=row["ClientMccMnc"],
                     ClientCurrencyCode=row["ClientCurrencyCode"],
                     ClientRate=row["ClientRate"],
-                    QuantityC=row["QuantityC"],
+                    Messages=row["QuantityC"],
                     ClientAmount=row["ClientAmount"],
                     ClientAmountUSD=row["ClientAmountUSD"],
                 )
@@ -644,7 +647,7 @@ def generate_answer_files(answerSmsDto):
                 .nunique()
                 .reset_index()
             )
-            list_clients["Result"] = list_clients["ClientCurrencyCode"] == 1
+            list_clients["Result"] = [True if x == 1 else False for x in list_clients["ClientCurrencyCode"]]
             list_clients = [
                 CarrierCurrencyDto(ClientId=int(row.ClientId), Result=row.Result)
                 for _, row in list_clients.iterrows()
@@ -662,6 +665,21 @@ def generate_answer_files(answerSmsDto):
         return {"status_code":500, "content":{"error": str(ex)}}
 
 def generate_answer_files_gmt_carriers(answerSmsDto):
+    
+    def apply_quickbox_name(cross_list, df_carriers):
+        # Crear un diccionario CarrierId -> QuickBoxName
+        carrier_map = df_carriers.set_index("CarrierId")["VendorQuickBoxName"].to_dict()
+
+        for rec in cross_list:
+            carrier_id = rec.get("CarrierId")
+            # Si existe QuickBoxName para ese carrier
+            if carrier_id in carrier_map:
+                rec["Client"] = carrier_map[carrier_id] if carrier_map[carrier_id] != "" else rec["Client"]
+            else:
+                # Valor por defecto si no hay coincidencia
+                rec["Client"] = rec.get("Client", rec["Client"])
+        return cross_list
+    
     try:
         carrier_list = fetch_carriers() 
         frames_gmt = {}
@@ -686,7 +704,7 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                 data = fetch_AnswerOriginateSms_By_date_carrier(
                     group, start_date, end_date, isAnswer=True
                 )
-                #frames.append(data)
+
                 frames_gmt[custom_gmt] = group
 
                 if not data.empty:
@@ -702,22 +720,23 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                         ).reset_index()
                     )
 
-                    # Convertir a DTOs
+                    grouped_ = pd.DataFrame(apply_quickbox_name(grouped.to_dict('records'), carrier_list))
+
                     grouped_data = [
                         AnswerOriginateSmsDto(
                             ClientId=int(row["ClientId"]) if row["ClientId"] else None,
-                            Client=row["Client"],
+                            Client=f"{row['Client']}_{row['ClientCurrencyCode']}",
                             ClientProduct=row["ClientProduct"],
                             ClientCountry=row["ClientCountry"],
-                            ClientNet=row["ClientNet"],
-                            ClientMccMnc=row["ClientMccMnc"],
+                            Network=row["ClientNet"],
+                            MccMnc=row["ClientMccMnc"],
                             ClientCurrencyCode=row["ClientCurrencyCode"],
                             ClientRate=row["ClientRate"],
-                            QuantityC=row["QuantityC"],
+                            Messages=row["QuantityC"],
                             ClientAmount=row["ClientAmount"],
                             ClientAmountUSD=row["ClientAmountUSD"],
                         )
-                        for _, row in grouped.iterrows()
+                        for _, row in grouped_.iterrows()
                         if row["QuantityC"] > 0
                     ]
 
@@ -725,10 +744,10 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                         raise Exception("There is no data for the selected dates")
 
                     # Generar CSV Raw
-                    raw_file = f"RawAnswerSMS_forGMT{custom_gmt}_{BillingCycle(billing_cycle_id).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.csv"
+                    raw_file = f"RawAnswerSMS_forGMT{custom_gmt}_{BillingCycle(billing_cycle_id).name}_{(billingCycleDateDto.StartDate - timedelta(days=1)):%Y%m%d%H%M}_{billingCycleDateDto.EndDate:%Y%m%d%H%M}.csv"
                     output_path = os.path.join("output", raw_file)
                     os.makedirs("output", exist_ok=True)
-                    pd.DataFrame(grouped).to_csv(output_path, index=False)
+                    pd.DataFrame(grouped_data).to_csv(output_path, index=False)
 
                     logger.info("Raw Excel file generated at: %s", output_path) 
 
@@ -737,16 +756,22 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                     except Exception: 
                         logger.exception("Error uploading raw answer CSV to sharepoint")
 
+                    df = pd.DataFrame(grouped)
+
+                    # agrupa y crea una df con clientId y cantidad de currencies distintas
                     list_clients = (
-                        pd.DataFrame(grouped)
-                        .groupby("ClientId")["ClientCurrencyCode"]
+                        df.groupby("ClientId")["ClientCurrencyCode"]
                         .nunique()
-                        .reset_index()
+                        .reset_index(name="QtyCurrencies")
                     )
-                    list_clients["Result"] = list_clients["ClientCurrencyCode"] == 1
+
+                    # si solo hay 1 moneda => True
+                    list_clients["Result"] = list_clients["QtyCurrencies"] == 1
+
+                    # convierte a DTO
                     list_clients = [
-                        CarrierCurrencyDto(ClientId=int(row.ClientId), Result=row.Result)
-                        for _, row in list_clients.iterrows()
+                        CarrierCurrencyDto(ClientId=int(r.ClientId), Result=r.Result)
+                        for _, r in list_clients.iterrows()
                     ]
 
                     # Generar archivo Importer
@@ -828,16 +853,16 @@ def get_answer_sms_get_monthly_fun(answerSmsDto):
                 for _, row in grouped.iterrows():
                     dto = AnswerOriginateSmsDto(
                         ClientId=row["ClientId"],
-                        Client=row["Client"],
+                        Client=f"{row['Client']}_{row['ClientCurrencyCode']}",
                         ClientProduct=row["ClientProduct"],
                         ClientCountry=row["ClientCountry"],
-                        ClientNet=row["ClientNet"],
-                        ClientMccMnc=row["ClientMccMnc"],
-                        ClientCurrencyCode=row["ClientCurrencyCode"],
+                        Network=row["ClientNet"],
+                        MccMnc=row["ClientMccMnc"],
                         ClientRate=row["ClientRate"],
-                        QuantityC=row["QuantityC"],
+                        Messages=row["QuantityC"],
                         ClientAmount=row["ClientAmount"],
-                        ClientAmountUSD=None, 
+                        ClientCurrencyCode=row["ClientCurrencyCode"],
+                        ClientAmountUSD=None
                     )
                     answer_sms_excel_dtos.append(dto)
 
@@ -850,7 +875,7 @@ def get_answer_sms_get_monthly_fun(answerSmsDto):
 
                 if data_by_carrier:
                     df_export = pd.DataFrame([d.__dict__ for d in data_by_carrier])
-                    file_name = f"Monthly_AnswerSms_EDR_{carrier_name}_{(billingCycleDateDto.StartDate):%m%d%Y}-{(billingCycleDateDto.EndDate):%m%d%Y}.csv"
+                    file_name = f"Monthly_AnswerSms_EDR_{carrier_name}_{(billingCycleDateDto.StartDate):%m%d%Y%H%M}-{(billingCycleDateDto.EndDate - timedelta(days=1)):%m%d%Y%H%M}.csv"
                     output_path = os.path.join("output", file_name)
                     os.makedirs("output", exist_ok=True)
 
@@ -872,6 +897,21 @@ def get_answer_sms_get_monthly_fun(answerSmsDto):
         send_email(to_emails, "Error Answer SMS Monthly EDR", message)
 
 def raw_originate_sms_gmt_fun(originateSmsDto):
+
+    def apply_quickbox_name(cross_list, df_carriers):
+        # Crear un diccionario CarrierId -> QuickBoxName
+        carrier_map = df_carriers.set_index("CarrierId")["VendorQuickBoxName"].to_dict()
+
+        for rec in cross_list:
+            carrier_id = rec.get("CarrierId")
+            # Si existe QuickBoxName para ese carrier
+            if carrier_id in carrier_map:
+                rec["Vendor"] = carrier_map[carrier_id] if carrier_map[carrier_id] != "" else rec["Vendor"]
+            else:
+                # Valor por defecto si no hay coincidencia
+                rec["Vendor"] = rec.get("Vendor", rec["Vendor"])
+        return cross_list
+
     try:
 
         df_carriers = fetch_carriers()
@@ -917,24 +957,27 @@ def raw_originate_sms_gmt_fun(originateSmsDto):
                 "VendorMccMnc", "VendorCurrencyCode", "VendorRate"
             ], dropna=False)
 
+            grouped = pd.DataFrame(apply_quickbox_name(grouped.to_dict('records'), df_carriers))
+
             rows = []
             for keys, group in grouped:
                 rows.append({
-                    "Vendor": keys[1],
+                    "Vendor": f"{keys[1]}_{keys[6]}",
                     "VendorProduct": keys[2],
                     "VendorCountry": keys[3],
                     "Network": keys[4],
                     "MccMnc": keys[5],
                     "VendorRate": keys[7],
-                    "VendorCurrencyCode": keys[6],
                     "Messages": int(group["QuantityV"].sum()),
-                    "VendorAmount": group["VendorAmount"].sum()
+                    "VendorAmount": group["VendorAmount"].sum(),
+                    "VendorCurrencyCode": keys[6],
+                    "VendorAmountUSD": group["VendorAmountUSD"].sum()
                 })
 
             df_output = pd.DataFrame(rows)
 
             filename = sanitize_filename(
-                f"GMT_RawOriginateSMS_{BillingCycle(billingCycleId).name}_{gmtDates.StartDate.strftime('%Y%m%d')}_{gmtDates.EndDate.strftime('%Y%m%d')}.csv"
+                f"GMT_RawOriginateSMS_{BillingCycle(billingCycleId).name}_{gmtDates.StartDate.strftime('%m%d%Y%H%M')}_{(gmtDates.EndDate - timedelta(days=1)).strftime('%m%d%Y%H%M')}.csv"
             )
             output_folder = "output"
             os.makedirs(output_folder, exist_ok=True)
@@ -971,6 +1014,7 @@ def raw_originate_sms_gmt_fun(originateSmsDto):
         return {"status_code":500, "message":{"error": f"Error generating report: {str(ex)}"}}
 
 def raw_originate_sms_fun(originateSmsDto):
+    
     try:
         df_carriers = fetch_carriers()
         billingCycleDate = calculate_query_dates_by_billing_cycle(originateSmsDto['billingCycleDate'], originateSmsDto['CarrierBillingCycleId'][0])
@@ -994,22 +1038,20 @@ def raw_originate_sms_fun(originateSmsDto):
             quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
 
             rows.append({
-                "VendorId": str(keys[0]),
-                "Vendor": keys[1],
+                "Vendor": f"{quickbox_name}_{keys[6]}" if quickbox_name else f"{keys[1]}_{keys[6]}",
                 "VendorProduct": keys[2],
                 "VendorCountry": keys[3],
                 "Network": keys[4],
                 "MccMnc": keys[5],
-                "VendorCurrencyCode": keys[6],
                 "VendorRate": keys[7],
                 "Messages": int(sum_quantity),
                 "VendorAmount": sum_amount,
-                "VendorAmountUSD": sum_amount_usd,
-                "VendorQuickBoxName": quickbox_name
+                "VendorCurrencyCode": keys[6],
+                "VendorAmountUSD": sum_amount_usd
             })
 
         df_output = pd.DataFrame(rows)
-        filename = sanitize_filename(f"RawOriginateSMS_{BillingCycle(originateSmsDto['CarrierBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
+        filename = sanitize_filename(f"RawOriginateSMS_{BillingCycle(originateSmsDto['CarrierBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%m%d%Y%H%M')}_{(billingCycleDate.EndDate - timedelta(days=1)).strftime('%m%d%Y%H%M')}.CSV")
         output_folder = "output"
         os.makedirs(output_folder, exist_ok=True)
         output_path = os.path.join(output_folder, filename)
@@ -1017,6 +1059,7 @@ def raw_originate_sms_fun(originateSmsDto):
         logger.info("CSV file generated at: %s", output_path)
         try:
             upload_sharepoint(output_path, filename)
+            os.remove(output_path)
         except Exception:
             logger.exception("Error uploading raw originate CSV to sharepoint")
         return JSONResponse(content={"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
@@ -1054,13 +1097,23 @@ async def raw_originate_sms(billingCycleDate: BillingCycleDateDto, billing_cycle
 
 @app.post("/api/sms/RawOriginateSms/gmt")
 async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                        "VendorBillingCycleId": [int(billing_cycle)], 
-                        "CarrierBillingCycleId": [int(billing_cycle)],
-                        "billingCycleDate": billingCycleDate}
-    
+    originateSmsDto = {
+        "ClientBillingCycleId": [int(billing_cycle)],
+        "VendorBillingCycleId": [int(billing_cycle)],
+        "CarrierBillingCycleId": [int(billing_cycle)],
+        "billingCycleDate": billingCycleDate
+    }
+
     job_id = register_job(raw_originate_sms_gmt_fun, originateSmsDto)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+    return JSONResponse(
+        content={
+            "message": "The request was created successfully.",
+            "job_id": job_id
+        },
+        status_code=202  # HTTP 202 = Accepted
+    )
+
 
 @app.post("/api/sms/RawOriginateSms/CustomGmt")
 async def raw_originate_sms_customGmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
@@ -1485,7 +1538,7 @@ def get_provisionals_sms_GMT_fun(model: dict, is_gmt: bool):
 
                 for rec in cross_list:
                     carrier_id = rec.get("CarrierId")
-                    # Si existe QuickBoxName para ese carrier, úsalo
+                    # Si existe QuickBoxName para ese carrier
                     if carrier_id in carrier_map:
                         rec["Client"] = carrier_map[carrier_id] if carrier_map[carrier_id] != "" else rec["Client"]
                     else:
@@ -1675,7 +1728,8 @@ async def get_provisionals_sms_GMT(billingCycleDate: BillingCycleDateDto, billin
                   "currency_ID": currency_ID}
     
     job_id = register_job(get_provisionals_sms_GMT_fun, provisionals_dto, True)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id},status_code=202  # HTTP 202 = Accepted
+                        )
 
 
 init()
@@ -1685,22 +1739,9 @@ if __name__ == "__main__":
     logger.debug('-----------------Init Application------------------------')
 
     uvicorn.run(
-         "main:app",
+         "worker:app",
          host="0.0.0.0",
          port=int(cfg.get_parameter("General", "port"))
     )
 
 # Para ejecutar: uvicorn main:app --port 8001 --reload
-
-'''
-calcula el biling cycle date
-recorre el billing cycle id
-determina el periodo con base a las fechas, si es mes fortnight o week
-trae la lista de carriers de alaris
-valida que el currency sea diferente de DIDs, si lo es valida si GMT es false/true con lo que divide los que tienen GMT desde apollo
-crea una lista de carriers con ambos resultados -> carrierList
-genera la consulta de answer/originate por carrier y ajusta las fechas si es carrier GMT
-valida que la lista answer/originate no este vacia y que los carrierID existan en alaris o que la cantidad sea mayor a 0
-!!!!!!! recorre la la lista de answer/originate para obtener el VendorQuickBoxName de la lista carrierList y lo asigna al campo Client del answer/originate
-genera la agrupacion por cliente/venedor y carrierid sumando cantidad y precio
-'''

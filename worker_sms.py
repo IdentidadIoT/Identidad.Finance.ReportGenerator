@@ -1,7 +1,8 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 from dataclasses import dataclass
 from typing import List, Dict, Optional
@@ -9,6 +10,7 @@ import pandas as pd
 from core.db import get_engine
 from core.logger import init_log
 from core.oracle_connector import create_oracle_connection, output_type_handler
+from core.auth import validate_token, init_auth, generate_token
 from core.sharepoint import init_sharepoint, upload_sharepoint
 from core.email import send_email, init_email
 import core.config as cfg
@@ -16,6 +18,7 @@ from core.config import init_config
 import os
 import re
 import time
+from zoneinfo import ZoneInfo
 import pytz
 import asyncio
 import uvicorn
@@ -24,10 +27,11 @@ import uuid
 import concurrent.futures
 
 
-global config, logger, interval_time, to_emails, to_emails_filtered_report, semaphore
+global config, logger, interval_time, to_emails, to_emails_report, semaphore, JOB_TTL_DAYS
 
 app = FastAPI()
 logger = init_log()
+security = HTTPBearer()
 
 process_pool = concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count())
 jobs = {}
@@ -35,17 +39,20 @@ semaphore = asyncio.Semaphore(5)
 
 
 def init():
-    global config, logger, interval_time, to_emails, to_emails_filtered_report
+    global config, logger, interval_time, to_emails, to_emails_report
 
     config = init_config()
     init_email()
+    init_auth()
     init_sharepoint()
     try:
         interval_time = int(cfg.get_parameter('General', 'interval_time_minutes'))
+        JOB_TTL_DAYS = int(cfg.get_parameter('General', 'JOB_TTL_DAYS'))
     except Exception:
         interval_time = 60
+        JOB_TTL_DAYS = 7
     to_emails = cfg.get_parameter('Smtp_Server', "to_emails")
-    to_emails_filtered_report = cfg.get_parameter('Smtp_Server', 'to_emails_filtered_report')
+    to_emails_report = cfg.get_parameter('Smtp_Server', 'to_emails_report')
 
 
 @app.middleware("http")
@@ -57,6 +64,7 @@ async def log_requests(request: Request, call_next):
     except Exception as ex:
         try:
             send_email(to_emails, f"Error {request.method}", f"Exception in {request.method} {request.url.path}: {str(ex)}")
+            #print(f"Error {request.method} \n Exception in {request.method} {request.url.path}: {str(ex)}")
         except Exception:
             logger.exception("Failed to send error email")
         logger.exception(f"Exception in {request.method} {request.url.path}: {str(ex)}")
@@ -65,13 +73,33 @@ async def log_requests(request: Request, call_next):
     logger.info(f"{request.method} {request.url.path} - END in {duration:.2f}s")
     return response
 
+def cleanup_old_jobs():
+    now = datetime.now(timezone.utc)
+    expiration = timedelta(days=JOB_TTL_DAYS)
+
+    expired_jobs = [
+        job_id
+        for job_id, job in jobs.items()
+        if now - job["created_at"] > expiration
+    ]
+
+    for job_id in expired_jobs:
+        jobs.pop(job_id, None)
+        logger.info(f"Job {job_id} eliminado por expiración (> {JOB_TTL_DAYS} días)")
+
 def register_job(func, *args, **kwargs):
+    cleanup_old_jobs()  #Limpieza al registrar
+
     job_id = str(uuid.uuid4())
     jobs[job_id] = {
         "status": "pending/queued",
         "result": None,
         "error": None,
-        "request": {"function": func.__name__, "args": args},
+        "request": {
+            "function": func.__name__,
+            "args": args
+        },
+        "created_at": datetime.now(timezone.utc) 
     }
 
     async def wrapper():
@@ -79,9 +107,10 @@ def register_job(func, *args, **kwargs):
             try:
                 jobs[job_id]["status"] = "running"
 
-                # Ejecutar la función en un proceso separado (usa otro núcleo)
                 loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(process_pool, func, *args, **kwargs)
+                result = await loop.run_in_executor(
+                    process_pool, func, *args, **kwargs
+                )
 
                 jobs[job_id]["status"] = "done"
                 jobs[job_id]["result"] = result
@@ -89,10 +118,11 @@ def register_job(func, *args, **kwargs):
             except Exception as e:
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = str(e)
-                logger.exception(f"Error ejecutando job {job_id} ({func.__name__})")
+                logger.exception(
+                    f"Error ejecutando job {job_id} ({func.__name__})"
+                )
 
-    loop = asyncio.get_event_loop()
-    loop.create_task(wrapper())
+    asyncio.create_task(wrapper())
     return job_id
 
 def sanitize_filename(filename: str) -> str:
@@ -103,6 +133,17 @@ def safe_float(val):
         return float(val)
     except (TypeError, ValueError):
         return 0.0
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = validate_token(token)
+        return payload
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token"
+        )
 
 
 class BillingCycleDateDto(BaseModel):
@@ -133,6 +174,10 @@ class FinancialAreaEquivalenceDto(BaseModel):
     Item: Optional[str] = None
     Name: Optional[str] = None
 
+class TokenRequest(BaseModel):
+    username: str
+    password: str
+
 
 @dataclass
 class ExcelImporterSmsDto:
@@ -157,11 +202,11 @@ class AnswerOriginateSmsDto:
     Client: Optional[str]
     ClientProduct: Optional[str]
     ClientCountry: Optional[str]
-    ClientNet: Optional[str]
-    ClientMccMnc: Optional[str]
+    Network: Optional[str]
+    MccMnc: Optional[str]
     ClientCurrencyCode: Optional[str]
     ClientRate: Optional[float]
-    QuantityC: int
+    Messages: int
     ClientAmount: Optional[float]
     ClientAmountUSD: Optional[float]
 
@@ -232,7 +277,6 @@ def fetch_carriers() -> pd.DataFrame:
         logger.exception("Error fetching Carriers data: %s", str(ex))
         return pd.DataFrame()
 
-
 def get_originate_reconciliation_by_period_sms(start_date: datetime, end_date: datetime, period: int) -> pd.DataFrame:
     try:
         engine = get_engine()
@@ -246,8 +290,6 @@ def get_originate_reconciliation_by_period_sms(start_date: datetime, end_date: d
     except Exception as ex:
         logger.exception("Error fetching Carriers data: %s", str(ex))
         return pd.DataFrame()
-
-
 
 def fetch_financial_area_equivalence() -> pd.DataFrame:
     try:
@@ -307,34 +349,40 @@ def raw_originate_sms_customGmt_fun(originateSmsDto):
             sum_amount_usd = group["VendorAmountUSD"].sum()
             carrier_info = df_carriers[df_carriers["CarrierId"].astype(str) == str(keys[0])]
             quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
-
+            custom_gmt_ = carrier_info["CustomGMT"].values[0] if not carrier_info.empty and "CustomGMT" in carrier_info.columns else None
             rows.append({
-                "VendorId": str(keys[0]),
-                "Vendor": keys[1],
+                "Vendor": f"{quickbox_name}_{keys[6]}" if quickbox_name else f"{keys[1]}_{keys[6]}",
                 "VendorProduct": keys[2],
                 "VendorCountry": keys[3],
                 "Network": keys[4],
                 "MccMnc": keys[5],
-                "VendorCurrencyCode": keys[6],
                 "VendorRate": keys[7],
                 "Messages": int(sum_quantity),
                 "VendorAmount": sum_amount,
-                "VendorAmountUSD": sum_amount_usd,
-                "VendorQuickBoxName": quickbox_name
+                "VendorCurrencyCode": keys[6],
+                "Custom GMT": custom_gmt_,
+                "VendorAmountUSD": sum_amount_usd
             })
 
         df_output = pd.DataFrame(rows)
-        filename = sanitize_filename(f"RawOriginateSMS_CustomGMT_{BillingCycle(originateSmsDto['VendorBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
+        filename = sanitize_filename(f"CustomGMT_OriginateSMS_{BillingCycle(originateSmsDto['VendorBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%m%d%Y%H%M')}_{(billingCycleDate.EndDate - timedelta(days=1)).strftime('%m%d%Y%H%M')}.CSV")
         output_folder = "output"
         os.makedirs(output_folder, exist_ok=True)
         output_path = os.path.join(output_folder, filename)
         df_output.to_csv(output_path, index=False)
         logger.info("CSV file generated at: %s", output_path)
         try:
-            upload_sharepoint(output_path, filename)
+            upload_sucess = upload_sharepoint(output_path, filename)
+            if os.path.exists(output_path) and upload_sucess:
+                time.sleep(1)  # deja liberar el lock
+                try:
+                    os.remove(output_path)
+                    logger.info("File deleted: %s", output_path)
+                except Exception:
+                    logger.exception("Failed to delete file")
         except Exception:
             logger.exception("Error uploading raw originate CSV to sharepoint")
-        return {"content":{"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, "status_code":200}
+        return {"content":{"message": "Report generated successfully.", "file_path": output_path, "rows": len(df_output)}, "status_code":200}
     except Exception as ex:
         logger.exception("Error procesando reporte raw originate")
         send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
@@ -377,12 +425,14 @@ def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, 
         return pd.DataFrame()
 
 def set_gmt_scheduled(billingCycleDateDto: BillingCycleDateDto) -> BillingCycleDateDto:
-    local_tz = datetime.now().astimezone().tzinfo
-    current_offset = local_tz.utcoffset(datetime.now())
+    local_tz = ZoneInfo("America/New_York")
+
+    start_local = billingCycleDateDto.StartDate.replace(tzinfo=local_tz)
+    end_local = billingCycleDateDto.EndDate.replace(tzinfo=local_tz)
 
     return BillingCycleDateDto(
-        StartDate=billingCycleDateDto.StartDate + current_offset,
-        EndDate=billingCycleDateDto.EndDate + current_offset
+        StartDate=start_local.astimezone(timezone.utc),
+        EndDate=end_local.astimezone(timezone.utc)
     )
 
 def create_answer_importer_excel_dto(
@@ -408,14 +458,18 @@ def create_answer_importer_excel_dto(
 
     currency_info = next((c for c in list_clients if c.ClientId == answer_data.ClientId), None)
 
+    customer_value= ""
+    
     if carrier is None:
         customer_value = f"carrier no existe {answer_data.Client}"
     else:
         quickbox = carrier.get("ClientQuickBoxName") or f"Nombre Quickbox no existe {carrier.get('Name')}"
         multi_currency = False if currency_info is None else not currency_info.Result
-        if multi_currency:
+        if not multi_currency:
             cur_code = answer_data.ClientCurrencyCode or ""
-            customer_value = f"{quickbox}_{cur_code.upper()}"
+            customer_value = f"{quickbox.strip()}_{cur_code.strip().upper()}"
+        else:
+            customer_value = f"{quickbox.strip()}"    
 
     if answer_importer_sms_excel_dtos:
         last_customer = answer_importer_sms_excel_dtos[-1].Customer
@@ -437,7 +491,7 @@ def create_answer_importer_excel_dto(
     note = cfg.get_parameter("Answer", "AnswerFinancialNote")
 
     dto = ExcelImporterSmsDto(
-        Customer=f"{customer_value}_",
+        Customer=customer_value, ################
         InvoiceNumber="Insert Bill Number" if len(answer_importer_sms_excel_dtos) == 0 else f"=IF(A{len(answer_importer_sms_excel_dtos)+2} = A{len(answer_importer_sms_excel_dtos)+1}, B{len(answer_importer_sms_excel_dtos)+1},B{len(answer_importer_sms_excel_dtos)+1}+1)",
         ItemCode=financial["Item"] if financial is not None else answer_data.ClientCountry,
         Destination=financial["Name"] if financial is not None else answer_data.ClientCountry,
@@ -449,8 +503,8 @@ def create_answer_importer_excel_dto(
         EmailSent=email_sent,
         Note=note,
         Rate=safe_float(answer_data.ClientRate),
-        Messages=safe_float(answer_data.QuantityC),
-        Amount=safe_float(answer_data.ClientRate) * safe_float(answer_data.QuantityC)
+        Messages=safe_float(answer_data.Messages),
+        Amount=safe_float(answer_data.ClientRate) * safe_float(answer_data.Messages)
     )
 
     answer_importer_sms_excel_dtos.append(dto)
@@ -464,7 +518,7 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
             ~carrier_list["ClientBillingCycleId"].fillna(0).astype(int).isin(answerOrDto["ClientBillingCycleId"])
         ]
 
-        print(invalid_carriers[["CarrierId", "Name", "ClientBillingCycleId"]].head(20))
+        #print(invalid_carriers[["CarrierId", "Name", "ClientBillingCycleId"]].head(20))
         
         for carrier_id in invalid_carriers["CarrierId"].astype(str).tolist():
             data = [d for d in data if d.ClientId not in (None, 0, int(carrier_id))]
@@ -533,8 +587,7 @@ def generate_excel_answer_importer_file(billingCycleId: int, answerOrDto, billin
         logger.info("Raw Excel file generated at: %s", output_path) 
                 
         try: 
-            print("----")
-            #upload_sharepoint(output_path, report_name) 
+            upload_sharepoint(output_path, report_name) 
         except Exception: 
             logger.exception("Error uploading raw answer CSV to sharepoint")
 
@@ -572,7 +625,7 @@ def generate_answer_files(answerSmsDto):
                 zip(carrier_list["CarrierId"].astype(str), carrier_list["ClientQuickBoxName"])
             )
 
-            # Aplicamos la lógica C# con pandas apply
+
             grouped["Client"] = grouped.apply(
                 lambda row: (
                     f"{carrier_map.get(str(row['ClientId']))}_{row['ClientCurrencyCode']}"
@@ -610,11 +663,11 @@ def generate_answer_files(answerSmsDto):
                     Client=row["Client"],
                     ClientProduct=row["ClientProduct"],
                     ClientCountry=row["ClientCountry"],
-                    ClientNet=row["ClientNet"],
-                    ClientMccMnc=row["ClientMccMnc"],
+                    Network=row["ClientNet"],
+                    MccMnc=row["ClientMccMnc"],
                     ClientCurrencyCode=row["ClientCurrencyCode"],
                     ClientRate=row["ClientRate"],
-                    QuantityC=row["QuantityC"],
+                    Messages=row["QuantityC"],
                     ClientAmount=row["ClientAmount"],
                     ClientAmountUSD=row["ClientAmountUSD"],
                 )
@@ -644,7 +697,7 @@ def generate_answer_files(answerSmsDto):
                 .nunique()
                 .reset_index()
             )
-            list_clients["Result"] = list_clients["ClientCurrencyCode"] == 1
+            list_clients["Result"] = [True if x == 1 else False for x in list_clients["ClientCurrencyCode"]]
             list_clients = [
                 CarrierCurrencyDto(ClientId=int(row.ClientId), Result=row.Result)
                 for _, row in list_clients.iterrows()
@@ -662,6 +715,21 @@ def generate_answer_files(answerSmsDto):
         return {"status_code":500, "content":{"error": str(ex)}}
 
 def generate_answer_files_gmt_carriers(answerSmsDto):
+    
+    def apply_quickbox_name(cross_list, df_carriers):
+        # Crear un diccionario CarrierId -> QuickBoxName
+        carrier_map = df_carriers.set_index("CarrierId")["VendorQuickBoxName"].to_dict()
+
+        for rec in cross_list:
+            carrier_id = rec.get("CarrierId")
+            # Si existe QuickBoxName para ese carrier
+            if carrier_id in carrier_map:
+                rec["Client"] = carrier_map[carrier_id] if carrier_map[carrier_id] != "" else rec["Client"]
+            else:
+                # Valor por defecto si no hay coincidencia
+                rec["Client"] = rec.get("Client", rec["Client"])
+        return cross_list
+    
     try:
         carrier_list = fetch_carriers() 
         frames_gmt = {}
@@ -686,7 +754,7 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                 data = fetch_AnswerOriginateSms_By_date_carrier(
                     group, start_date, end_date, isAnswer=True
                 )
-                #frames.append(data)
+
                 frames_gmt[custom_gmt] = group
 
                 if not data.empty:
@@ -702,22 +770,23 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                         ).reset_index()
                     )
 
-                    # Convertir a DTOs
+                    grouped_ = pd.DataFrame(apply_quickbox_name(grouped.to_dict('records'), carrier_list))
+
                     grouped_data = [
                         AnswerOriginateSmsDto(
                             ClientId=int(row["ClientId"]) if row["ClientId"] else None,
-                            Client=row["Client"],
+                            Client=f"{row['Client']}_{row['ClientCurrencyCode']}",
                             ClientProduct=row["ClientProduct"],
                             ClientCountry=row["ClientCountry"],
-                            ClientNet=row["ClientNet"],
-                            ClientMccMnc=row["ClientMccMnc"],
+                            Network=row["ClientNet"],
+                            MccMnc=row["ClientMccMnc"],
                             ClientCurrencyCode=row["ClientCurrencyCode"],
                             ClientRate=row["ClientRate"],
-                            QuantityC=row["QuantityC"],
+                            Messages=row["QuantityC"],
                             ClientAmount=row["ClientAmount"],
                             ClientAmountUSD=row["ClientAmountUSD"],
                         )
-                        for _, row in grouped.iterrows()
+                        for _, row in grouped_.iterrows()
                         if row["QuantityC"] > 0
                     ]
 
@@ -725,10 +794,10 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                         raise Exception("There is no data for the selected dates")
 
                     # Generar CSV Raw
-                    raw_file = f"RawAnswerSMS_forGMT{custom_gmt}_{BillingCycle(billing_cycle_id).name}_{billingCycleDateDto.StartDate:%Y%m%d}_{billingCycleDateDto.EndDate:%Y%m%d}.csv"
+                    raw_file = f"RawAnswerSMS_forGMT{custom_gmt}_{BillingCycle(billing_cycle_id).name}_{(billingCycleDateDto.StartDate - timedelta(days=1)):%Y%m%d%H%M}_{billingCycleDateDto.EndDate:%Y%m%d%H%M}.csv"
                     output_path = os.path.join("output", raw_file)
                     os.makedirs("output", exist_ok=True)
-                    pd.DataFrame(grouped).to_csv(output_path, index=False)
+                    pd.DataFrame(grouped_data).to_csv(output_path, index=False)
 
                     logger.info("Raw Excel file generated at: %s", output_path) 
 
@@ -737,16 +806,22 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
                     except Exception: 
                         logger.exception("Error uploading raw answer CSV to sharepoint")
 
+                    df = pd.DataFrame(grouped)
+
+                    # agrupa y crea una df con clientId y cantidad de currencies distintas
                     list_clients = (
-                        pd.DataFrame(grouped)
-                        .groupby("ClientId")["ClientCurrencyCode"]
+                        df.groupby("ClientId")["ClientCurrencyCode"]
                         .nunique()
-                        .reset_index()
+                        .reset_index(name="QtyCurrencies")
                     )
-                    list_clients["Result"] = list_clients["ClientCurrencyCode"] == 1
+
+                    # si solo hay 1 moneda => True
+                    list_clients["Result"] = list_clients["QtyCurrencies"] == 1
+
+                    # convierte a DTO
                     list_clients = [
-                        CarrierCurrencyDto(ClientId=int(row.ClientId), Result=row.Result)
-                        for _, row in list_clients.iterrows()
+                        CarrierCurrencyDto(ClientId=int(r.ClientId), Result=r.Result)
+                        for _, r in list_clients.iterrows()
                     ]
 
                     # Generar archivo Importer
@@ -828,16 +903,16 @@ def get_answer_sms_get_monthly_fun(answerSmsDto):
                 for _, row in grouped.iterrows():
                     dto = AnswerOriginateSmsDto(
                         ClientId=row["ClientId"],
-                        Client=row["Client"],
+                        Client=f"{row['Client']}_{row['ClientCurrencyCode']}",
                         ClientProduct=row["ClientProduct"],
                         ClientCountry=row["ClientCountry"],
-                        ClientNet=row["ClientNet"],
-                        ClientMccMnc=row["ClientMccMnc"],
-                        ClientCurrencyCode=row["ClientCurrencyCode"],
+                        Network=row["ClientNet"],
+                        MccMnc=row["ClientMccMnc"],
                         ClientRate=row["ClientRate"],
-                        QuantityC=row["QuantityC"],
+                        Messages=row["QuantityC"],
                         ClientAmount=row["ClientAmount"],
-                        ClientAmountUSD=None, 
+                        ClientCurrencyCode=row["ClientCurrencyCode"],
+                        ClientAmountUSD=None
                     )
                     answer_sms_excel_dtos.append(dto)
 
@@ -850,7 +925,7 @@ def get_answer_sms_get_monthly_fun(answerSmsDto):
 
                 if data_by_carrier:
                     df_export = pd.DataFrame([d.__dict__ for d in data_by_carrier])
-                    file_name = f"Monthly_AnswerSms_EDR_{carrier_name}_{(billingCycleDateDto.StartDate):%m%d%Y}-{(billingCycleDateDto.EndDate):%m%d%Y}.csv"
+                    file_name = f"Monthly_AnswerSms_EDR_{carrier_name}_{(billingCycleDateDto.StartDate):%m%d%Y%H%M}-{(billingCycleDateDto.EndDate - timedelta(days=1)):%m%d%Y%H%M}.csv"
                     output_path = os.path.join("output", file_name)
                     os.makedirs("output", exist_ok=True)
 
@@ -872,6 +947,21 @@ def get_answer_sms_get_monthly_fun(answerSmsDto):
         send_email(to_emails, "Error Answer SMS Monthly EDR", message)
 
 def raw_originate_sms_gmt_fun(originateSmsDto):
+
+    def apply_quickbox_name(cross_list, df_carriers):
+        # Crear un diccionario CarrierId -> QuickBoxName
+        carrier_map = df_carriers.set_index("CarrierId")["VendorQuickBoxName"].to_dict()
+
+        for rec in cross_list:
+            carrier_id = rec.get("CarrierId")
+            # Si existe QuickBoxName para ese carrier
+            if carrier_id in carrier_map:
+                rec["Vendor"] = carrier_map[carrier_id] if carrier_map[carrier_id] != "" else rec["Vendor"]
+            else:
+                # Valor por defecto si no hay coincidencia
+                rec["Vendor"] = rec.get("Vendor", rec["Vendor"])
+        return cross_list
+
     try:
 
         df_carriers = fetch_carriers()
@@ -917,24 +1007,27 @@ def raw_originate_sms_gmt_fun(originateSmsDto):
                 "VendorMccMnc", "VendorCurrencyCode", "VendorRate"
             ], dropna=False)
 
+            grouped = pd.DataFrame(apply_quickbox_name(grouped.to_dict('records'), df_carriers))
+
             rows = []
             for keys, group in grouped:
                 rows.append({
-                    "Vendor": keys[1],
+                    "Vendor": f"{keys[1]}_{keys[6]}",
                     "VendorProduct": keys[2],
                     "VendorCountry": keys[3],
                     "Network": keys[4],
                     "MccMnc": keys[5],
                     "VendorRate": keys[7],
-                    "VendorCurrencyCode": keys[6],
                     "Messages": int(group["QuantityV"].sum()),
-                    "VendorAmount": group["VendorAmount"].sum()
+                    "VendorAmount": group["VendorAmount"].sum(),
+                    "VendorCurrencyCode": keys[6],
+                    "VendorAmountUSD": group["VendorAmountUSD"].sum()
                 })
 
             df_output = pd.DataFrame(rows)
 
             filename = sanitize_filename(
-                f"GMT_RawOriginateSMS_{BillingCycle(billingCycleId).name}_{gmtDates.StartDate.strftime('%Y%m%d')}_{gmtDates.EndDate.strftime('%Y%m%d')}.csv"
+                f"GMT_RawOriginateSMS_{BillingCycle(billingCycleId).name}_{gmtDates.StartDate.strftime('%m%d%Y%H%M')}_{(gmtDates.EndDate - timedelta(days=1)).strftime('%m%d%Y%H%M')}.csv"
             )
             output_folder = "output"
             os.makedirs(output_folder, exist_ok=True)
@@ -946,7 +1039,14 @@ def raw_originate_sms_gmt_fun(originateSmsDto):
             generated_files.append(output_path)
 
             try:
-                upload_sharepoint(output_path, filename)
+                upload_sucess = upload_sharepoint(output_path, filename)
+                if os.path.exists(output_path) and upload_sucess:
+                    time.sleep(1)  # deja liberar el lock
+                    try:
+                        os.remove(output_path)
+                        logger.info("File deleted: %s", output_path)
+                    except Exception:
+                        logger.exception("Failed to delete file")
             except Exception:
                 logger.exception("Error uploading GMT originate Excel to SharePoint")
 
@@ -971,6 +1071,7 @@ def raw_originate_sms_gmt_fun(originateSmsDto):
         return {"status_code":500, "message":{"error": f"Error generating report: {str(ex)}"}}
 
 def raw_originate_sms_fun(originateSmsDto):
+    
     try:
         df_carriers = fetch_carriers()
         billingCycleDate = calculate_query_dates_by_billing_cycle(originateSmsDto['billingCycleDate'], originateSmsDto['CarrierBillingCycleId'][0])
@@ -994,119 +1095,41 @@ def raw_originate_sms_fun(originateSmsDto):
             quickbox_name = carrier_info["VendorQuickBoxName"].values[0] if not carrier_info.empty and "VendorQuickBoxName" in carrier_info.columns else None
 
             rows.append({
-                "VendorId": str(keys[0]),
-                "Vendor": keys[1],
+                "Vendor": f"{quickbox_name}_{keys[6]}" if quickbox_name else f"{keys[1]}_{keys[6]}",
                 "VendorProduct": keys[2],
                 "VendorCountry": keys[3],
                 "Network": keys[4],
                 "MccMnc": keys[5],
-                "VendorCurrencyCode": keys[6],
                 "VendorRate": keys[7],
                 "Messages": int(sum_quantity),
                 "VendorAmount": sum_amount,
-                "VendorAmountUSD": sum_amount_usd,
-                "VendorQuickBoxName": quickbox_name
+                "VendorCurrencyCode": keys[6],
+                "VendorAmountUSD": sum_amount_usd
             })
 
         df_output = pd.DataFrame(rows)
-        filename = sanitize_filename(f"RawOriginateSMS_{BillingCycle(originateSmsDto['CarrierBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%Y%m%d')}_{billingCycleDate.EndDate.strftime('%Y%m%d')}.CSV")
+        filename = sanitize_filename(f"RawOriginateSMS_{BillingCycle(originateSmsDto['CarrierBillingCycleId'][0]).name}_{billingCycleDate.StartDate.strftime('%m%d%Y%H%M')}_{(billingCycleDate.EndDate - timedelta(days=1)).strftime('%m%d%Y%H%M')}.CSV")
         output_folder = "output"
         os.makedirs(output_folder, exist_ok=True)
         output_path = os.path.join(output_folder, filename)
         df_output.to_csv(output_path, index=False)
         logger.info("CSV file generated at: %s", output_path)
         try:
-            upload_sharepoint(output_path, filename)
+            upload_sucess = upload_sharepoint(output_path, filename)
+            if os.path.exists(output_path) and upload_sucess:
+                time.sleep(1)  # deja liberar el lock
+                try:
+                    os.remove(output_path)
+                    logger.info("File deleted: %s", output_path)
+                except Exception:
+                    logger.exception("Failed to delete file")
         except Exception:
             logger.exception("Error uploading raw originate CSV to sharepoint")
-        return JSONResponse(content={"message": "Reporte generado exitosamente.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
+        return JSONResponse(content={"message": "Report generated successfully.", "file_path": output_path, "rows": len(df_output)}, status_code=200)
     except Exception as ex:
         logger.exception("Error procesando reporte raw originate")
         send_email(to_emails, "Error raw originate", f"Exception: {str(ex)}")
         return JSONResponse(status_code=500, content={"error": f"Error procesando reporte: {str(ex)}"})
-
-
-@app.get("/api")
-async def email_test():
-    try:
-        send_email(to_emails, "test email to_emails", "test email to_emails")
-        send_email(to_emails_filtered_report, "test email to_emails_filtered_report", "test email to_emails_filtered_report")
-    except Exception:
-        logger.exception("Error sending test emails")
-    return {"message": "emails sends succesfull"}
-
-@app.get("/api/sms/jobs")
-async def get_jobs():
-    return {"Status:": "pending/queued → created but not started yet.  running → currently in execution.  done → finished successfully.  error → finished with an exception.",
-            "List of jobs": jobs            
-            }
-
-
-@app.post("/api/sms/RawOriginateSms")
-async def raw_originate_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                        "VendorBillingCycleId": [int(billing_cycle)], 
-                        "CarrierBillingCycleId": [int(billing_cycle)],
-                        "billingCycleDate": billingCycleDate}
-    
-    job_id = register_job(raw_originate_sms_fun, originateSmsDto)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
-
-@app.post("/api/sms/RawOriginateSms/gmt")
-async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                        "VendorBillingCycleId": [int(billing_cycle)], 
-                        "CarrierBillingCycleId": [int(billing_cycle)],
-                        "billingCycleDate": billingCycleDate}
-    
-    job_id = register_job(raw_originate_sms_gmt_fun, originateSmsDto)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
-
-@app.post("/api/sms/RawOriginateSms/CustomGmt")
-async def raw_originate_sms_customGmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                  "VendorBillingCycleId": [int(billing_cycle)], 
-                  "CarrierBillingCycleId": [int(billing_cycle)],
-                  "billingCycleDate": billingCycleDate}
-
-    job_id = register_job(raw_originate_sms_customGmt_fun, originateSmsDto)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
-
-
-@app.post("/api/sms/RawAnswerSms")
-async def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int):
-    
-    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                  "InvoiceNumber": InvoiceNumber, 
-                  "VendorBillingCycleId": [int(billing_cycle)], 
-                  "CarrierBillingCycleId": [int(billing_cycle)],
-                  "billingCycleDate": billingCycleDate}
-
-    job_id = register_job(generate_answer_files, answer_dto)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
-
-@app.post("/api/sms/RawAnswerSm/GMTCarriers")
-async def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int):
-    
-    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                  "InvoiceNumber": InvoiceNumber, 
-                  "VendorBillingCycleId": [int(billing_cycle)], 
-                  "CarrierBillingCycleId": [int(billing_cycle)],
-                  "billingCycleDate": billingCycleDate}
-
-    job_id = register_job(generate_answer_files_gmt_carriers, answer_dto)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
-
-@app.post("/api/sms/RawAnswerSm/MonthlyEdrs")
-async def get_answer_sms_monthly(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle):
-    
-    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                  "VendorBillingCycleId": [int(billing_cycle)], 
-                  "CarrierBillingCycleId": [int(billing_cycle)],
-                  "billingCycleDate": billingCycleDate}
-    
-    job_id = register_job(get_answer_sms_get_monthly_fun, answer_dto)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
 
 def get_alaris_active_carrier():
     try:
@@ -1221,10 +1244,6 @@ def cross_data(data_answer_sum, data_orig_sum, carrier_list, billing_cycle_id,
 
         return df
 
-    # cross_weekly = apply_quickbox_name(cross_weekly)
-    # cross_fornightly = apply_quickbox_name(cross_fornightly)
-    # cross_monthly = apply_quickbox_name(cross_monthly)
-
     cross_weekly = group_report(cross_weekly, head_first="Weekly")
     cross_fornightly = group_report(cross_fornightly, head_first="Fortnightly")
     cross_monthly = group_report(cross_monthly, head_first="Monthly")
@@ -1308,7 +1327,14 @@ def cross_data(data_answer_sum, data_orig_sum, carrier_list, billing_cycle_id,
 
     logger.info(filename, " Excel generated at: %s", output_path)
     try:
-        upload_sharepoint(output_path, filename)
+        upload_sucess = upload_sharepoint(output_path, filename)
+        if os.path.exists(output_path) and upload_sucess:
+                time.sleep(1)  # deja liberar el lock
+                try:
+                    os.remove(output_path)
+                    logger.info("File deleted: %s", output_path)
+                except Exception:
+                    logger.exception("Failed to delete file")
     except Exception as ex:
         logger.warning("SharePoint upload failed: %s", str(ex))
 
@@ -1406,19 +1432,7 @@ def get_provisionals_sms_fun(model: dict, is_gmt: bool):
         logger.exception(message)
         send_email(to_emails, "Error CrossReport", message)
         return {"status_code": 500, "content": {"error": message}}
-    
-@app.post("/api/sms/Provisionals")
-async def get_provisionals_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, currency_ID: CurrencyID):
-    provisionals_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
-                  "VendorBillingCycleId": [int(billing_cycle)], 
-                  "CarrierBillingCycleId": [int(billing_cycle)],
-                  "billingCycleDate": billingCycleDate,
-                  "currency_ID": currency_ID}
-    
-    job_id = register_job(get_provisionals_sms_fun, provisionals_dto, False)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
-
-
+ 
 def get_provisionals_sms_GMT_fun(model: dict, is_gmt: bool):
     try:
         message = ""
@@ -1485,7 +1499,7 @@ def get_provisionals_sms_GMT_fun(model: dict, is_gmt: bool):
 
                 for rec in cross_list:
                     carrier_id = rec.get("CarrierId")
-                    # Si existe QuickBoxName para ese carrier, úsalo
+                    # Si existe QuickBoxName para ese carrier
                     if carrier_id in carrier_map:
                         rec["Client"] = carrier_map[carrier_id] if carrier_map[carrier_id] != "" else rec["Client"]
                     else:
@@ -1666,8 +1680,120 @@ def get_provisionals_sms_GMT_fun(model: dict, is_gmt: bool):
         send_email(to_emails, "Error CrossReport_Reconciliation", message)
         return {"status_code": 500, "content": {"error": message}}
 
+def fun_handle_get_token(request: TokenRequest):
+    try:
+        body = request.dict()
+        token = generate_token(body)
+        if token:
+            return {"token": token}
+        else:
+            return JSONResponse(status_code=401)
+    except Exception as err:
+        message = "An error ocurred getting token, Error: " + str(err)
+        logger.error(message)
+        return JSONResponse(status_code=500)
+
+
+@app.post("/api/sms/token")
+async def handle_get_token(request: TokenRequest):
+    return fun_handle_get_token(request)
+
+@app.get("/api/sms/jobs")
+async def get_jobs():
+    return {"Status:": "pending/queued → created but not started yet.  running → currently in execution.  done → finished successfully.  error → finished with an exception.",
+            "List of jobs": jobs            
+            }
+
+
+@app.post("/api/sms/RawOriginateSms")
+async def raw_originate_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, token_data: dict = Depends(verify_token)):
+    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                        "VendorBillingCycleId": [int(billing_cycle)], 
+                        "CarrierBillingCycleId": [int(billing_cycle)],
+                        "billingCycleDate": billingCycleDate}
+    
+    job_id = register_job(raw_originate_sms_fun, originateSmsDto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+@app.post("/api/sms/RawOriginateSms/gmt")
+async def raw_originate_sms_gmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, token_data: dict = Depends(verify_token)):
+    originateSmsDto = {
+        "ClientBillingCycleId": [int(billing_cycle)],
+        "VendorBillingCycleId": [int(billing_cycle)],
+        "CarrierBillingCycleId": [int(billing_cycle)],
+        "billingCycleDate": billingCycleDate
+    }
+
+    job_id = register_job(raw_originate_sms_gmt_fun, originateSmsDto)
+
+    return JSONResponse(
+        content={
+            "message": "The request was created successfully.",
+            "job_id": job_id
+        },
+        status_code=202  # HTTP 202 = Accepted
+    )
+
+@app.post("/api/sms/RawOriginateSms/CustomGmt")
+async def raw_originate_sms_customGmt(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, token_data: dict = Depends(verify_token)):
+    originateSmsDto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate}
+
+    job_id = register_job(raw_originate_sms_customGmt_fun, originateSmsDto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+
+@app.post("/api/sms/RawAnswerSms")
+async def get_answer_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, token_data: dict = Depends(verify_token)):
+    
+    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "InvoiceNumber": InvoiceNumber, 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate}
+
+    job_id = register_job(generate_answer_files, answer_dto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+@app.post("/api/sms/RawAnswerSms/GMTCarriers")
+async def get_answer_sms_gmt_carriers(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, InvoiceNumber: int, token_data: dict = Depends(verify_token)):
+    
+    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "InvoiceNumber": InvoiceNumber, 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate}
+
+    job_id = register_job(generate_answer_files_gmt_carriers, answer_dto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+@app.post("/api/sms/RawAnswerSms/MonthlyEdrs")
+async def get_answer_sms_monthly(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, token_data: dict = Depends(verify_token)):
+    
+    answer_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate}
+    
+    job_id = register_job(get_answer_sms_get_monthly_fun, answer_dto)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
+
+@app.post("/api/sms/Provisionals")
+async def get_provisionals_sms(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, currency_ID: CurrencyID, token_data: dict = Depends(verify_token)):
+    provisionals_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
+                  "VendorBillingCycleId": [int(billing_cycle)], 
+                  "CarrierBillingCycleId": [int(billing_cycle)],
+                  "billingCycleDate": billingCycleDate,
+                  "currency_ID": currency_ID}
+    
+    job_id = register_job(get_provisionals_sms_fun, provisionals_dto, False)
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+
 @app.post("/api/sms/Provisionals/GMT")
-async def get_provisionals_sms_GMT(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, currency_ID: CurrencyID):
+async def get_provisionals_sms_GMT(billingCycleDate: BillingCycleDateDto, billing_cycle: BillingCycle, currency_ID: CurrencyID, token_data: dict = Depends(verify_token)):
     provisionals_dto = {"ClientBillingCycleId": [int(billing_cycle)], 
                   "VendorBillingCycleId": [int(billing_cycle)], 
                   "CarrierBillingCycleId": [int(billing_cycle)],
@@ -1675,7 +1801,8 @@ async def get_provisionals_sms_GMT(billingCycleDate: BillingCycleDateDto, billin
                   "currency_ID": currency_ID}
     
     job_id = register_job(get_provisionals_sms_GMT_fun, provisionals_dto, True)
-    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id})
+    return JSONResponse(content={"message": "The request was created successfully.", "job_id": job_id},status_code=202  # HTTP 202 = Accepted
+                        )
 
 
 init()
@@ -1685,22 +1812,9 @@ if __name__ == "__main__":
     logger.debug('-----------------Init Application------------------------')
 
     uvicorn.run(
-         "main:app",
+         "worker_sms:app",
          host="0.0.0.0",
          port=int(cfg.get_parameter("General", "port"))
     )
 
-# Para ejecutar: uvicorn main:app --port 8001 --reload
-
-'''
-calcula el biling cycle date
-recorre el billing cycle id
-determina el periodo con base a las fechas, si es mes fortnight o week
-trae la lista de carriers de alaris
-valida que el currency sea diferente de DIDs, si lo es valida si GMT es false/true con lo que divide los que tienen GMT desde apollo
-crea una lista de carriers con ambos resultados -> carrierList
-genera la consulta de answer/originate por carrier y ajusta las fechas si es carrier GMT
-valida que la lista answer/originate no este vacia y que los carrierID existan en alaris o que la cantidad sea mayor a 0
-!!!!!!! recorre la la lista de answer/originate para obtener el VendorQuickBoxName de la lista carrierList y lo asigna al campo Client del answer/originate
-genera la agrupacion por cliente/venedor y carrierid sumando cantidad y precio
-'''
+# Para ejecutar: uvicorn worker_sms:app --port 8001 --reload

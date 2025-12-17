@@ -40,7 +40,7 @@ def init_email():
     global password
     global from_email
     global to_emails
-    global to_emails_filtered_report
+    global to_emails_report
     global logger
 
     logger = get_logger()
@@ -50,4 +50,4 @@ def init_email():
     password = cfg.get_parameter('Smtp_Server', "password")
     from_email = cfg.get_parameter('Smtp_Server', "from_email")
     to_emails = cfg.get_parameter('Smtp_Server', "to_emails")
-    to_emails_filtered_report = cfg.get_parameter('Smtp_Server', "to_emails_filtered_report")
+    to_emails_report = cfg.get_parameter('Smtp_Server', "to_emails_report")
