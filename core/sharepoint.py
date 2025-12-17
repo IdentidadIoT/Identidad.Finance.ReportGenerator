@@ -12,9 +12,8 @@ __all__ = ['init_sharepoint', 'upload_sharepoint']
 
 def init_sharepoint():
     global tenant_id, client_id, client_secret, site_domain, site_path, folder_path
-    global logger, token, graph_base_url, to_emails, to_emails_filtered_report
+    global logger, token, graph_base_url, to_emails, to_emails_report
 
-    # Inicializar email (si necesitas enviar notificaciones)
     init_email()
 
     # Log
@@ -31,7 +30,7 @@ def init_sharepoint():
 
     # Emails
     to_emails = cfg.get_parameter("Smtp_Server", "to_emails")
-    to_emails_filtered_report = cfg.get_parameter("Smtp_Server", "to_emails_filtered_report")
+    to_emails_report = cfg.get_parameter("Smtp_Server", "to_emails_report")
 
     # Autenticación
     token = _get_graph_token()
@@ -113,12 +112,16 @@ def upload_sharepoint(file_path: str, file_name: str):
 
         # Notificación de éxito
         message = f" Informative Message! ** The {file_name}** report was generated in SharePoint.\n\n URL: {web_url}"
-        send_email(to_emails_filtered_report, "Success: OriginateSMS Report - Apollo", message)
+        send_email(to_emails_report, "Success: AnswerOriginateSMS Report - Apollo", message)
+        
+        return True
 
     except Exception as err:
         logger.error(f"Error uploading file to SharePoint: {str(err)}")
         message = f"There was an error uploading file **{file_name}** to SharePoint:\n\n{str(err)}"
-        send_email(to_emails, "Error: OriginateSMS Report - Apollo", message)
+        send_email(to_emails, "Error: AnswerOriginateSMS Report - Apollo", message)
+
+        return False
 
 
 def _get_site_id():
