@@ -1,5 +1,23 @@
+"""
+/*************************************************************************
+ * 
+ *  [2022] Identidad Technologies. 
+ *  All Rights Reserved.
+ * 
+ * NOTICE:  All information contained herein is, and remains
+ * the property of Identidad Technologies,
+ * The intellectual and technical concepts contained
+ * herein are proprietary to Identidad Technologies
+ * Dissemination of this information or reproduction of this material
+ * is strictly forbidden unless prior written permission is obtained
+ * from Identidad Technologies.
+ */
+"""
+
+
 from core.config import init_config, get_parameter
 import oracledb
+
 print("Modo de conexión Oracle:", "THIN" if oracledb.is_thin_mode() else "THICK")
 
 
