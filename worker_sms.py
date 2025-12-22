@@ -74,8 +74,8 @@ async def log_requests(request: Request, call_next):
     return response
 
 def cleanup_old_jobs():
-    now = datetime.now(timezone.utc)
-    expiration = timedelta(days=JOB_TTL_DAYS)
+    now = datetime.now(ZoneInfo("America/New_York"))
+    expiration = timedelta(days=7)
 
     expired_jobs = [
         job_id
@@ -85,7 +85,7 @@ def cleanup_old_jobs():
 
     for job_id in expired_jobs:
         jobs.pop(job_id, None)
-        logger.info(f"Job {job_id} eliminado por expiración (> {JOB_TTL_DAYS} días)")
+        logger.info(f"Job {job_id} eliminado por expiración (> 7 días)")
 
 def register_job(func, *args, **kwargs):
     cleanup_old_jobs()  #Limpieza al registrar
@@ -99,7 +99,7 @@ def register_job(func, *args, **kwargs):
             "function": func.__name__,
             "args": args
         },
-        "created_at": datetime.now(timezone.utc) 
+        "created_at": datetime.now(ZoneInfo("America/New_York"))
     }
 
     async def wrapper():
@@ -265,6 +265,18 @@ def calculate_query_dates_by_billing_cycle(answer_dto: BillingCycleDateDto, bill
     # default / BIWEEKLY
     return set_dates_from_input(answer_dto.StartDate, answer_dto.EndDate)
 
+def set_gmt_scheduled(billingCycleDateDto: BillingCycleDateDto) -> BillingCycleDateDto:
+    local_tz = ZoneInfo("America/New_York")
+
+    start_local = billingCycleDateDto.StartDate.replace(tzinfo=local_tz)
+    end_local = billingCycleDateDto.EndDate.replace(tzinfo=local_tz)
+
+    return BillingCycleDateDto(
+        StartDate=start_local.astimezone(timezone.utc),
+        EndDate=end_local.astimezone(timezone.utc)
+    )
+
+
 
 def fetch_carriers() -> pd.DataFrame:
     try:
@@ -314,13 +326,23 @@ def raw_originate_sms_customGmt_fun(originateSmsDto):
         frames = []
 
         for custom_gmt, group in df_carriers.groupby("CustomGMT"):
-            local_offset = datetime.now().astimezone().utcoffset()
-            current_offset_hours = int(local_offset.total_seconds() / 3600)
+            #local_offset = datetime.now().astimezone().utcoffset()
+            #current_offset_hours = int(local_offset.total_seconds() / 3600)
 
-            custom_time_span = current_offset_hours if custom_gmt == 0 else current_offset_hours - custom_gmt
+            #custom_time_span = current_offset_hours if custom_gmt == 0 else current_offset_hours - custom_gmt
 
-            start_date = billingCycleDate.StartDate + timedelta(hours=custom_time_span)
-            end_date = billingCycleDate.EndDate + timedelta(hours=custom_time_span)
+            fecha1 = billingCycleDate.StartDate
+            fecha2 = billingCycleDate.EndDate
+            miami_tz = ZoneInfo("America/New_York")
+            fecha_miami = fecha1.replace(tzinfo=miami_tz)
+            offset = fecha_miami.utcoffset().total_seconds() / 3600
+            fecha_miami_2 = fecha2.replace(tzinfo=miami_tz)
+            offset_2 = fecha_miami_2.utcoffset().total_seconds() / 3600
+
+            #custom_time_span = current_offset_hours if custom_gmt == 0 else current_offset_hours - custom_gmt
+
+            start_date = billingCycleDate.StartDate + timedelta(hours=offset if custom_gmt == 0 else offset - custom_gmt)
+            end_date = billingCycleDate.EndDate + timedelta(hours=offset_2 if custom_gmt == 0 else offset_2 - custom_gmt)
 
             # pasar el sub-dataframe con todos los CarrierId del grupo
             df_result = fetch_AnswerOriginateSms_By_date_carrier(group, start_date, end_date, isAnswer=False)
@@ -423,17 +445,6 @@ def fetch_AnswerOriginateSms_By_date_carrier(df_carriers, start_date: datetime, 
     except Exception as ex:
         logger.exception("Error fetching AnswerOriginateSms data: %s", str(ex))
         return pd.DataFrame()
-
-def set_gmt_scheduled(billingCycleDateDto: BillingCycleDateDto) -> BillingCycleDateDto:
-    local_tz = ZoneInfo("America/New_York")
-
-    start_local = billingCycleDateDto.StartDate.replace(tzinfo=local_tz)
-    end_local = billingCycleDateDto.EndDate.replace(tzinfo=local_tz)
-
-    return BillingCycleDateDto(
-        StartDate=start_local.astimezone(timezone.utc),
-        EndDate=end_local.astimezone(timezone.utc)
-    )
 
 def create_answer_importer_excel_dto(
     answer_or_dto,
@@ -743,13 +754,20 @@ def generate_answer_files_gmt_carriers(answerSmsDto):
 
             for custom_gmt, group in carrier_list.groupby("CustomGMT"):
                 
-                local_offset = datetime.now(pytz.timezone('America/New_York'))
-                current_offset_hours = (int(local_offset.strftime('%z'))/100)
+                #local_offset = datetime.now(pytz.timezone('America/New_York'))
+                #current_offset_hours = (int(local_offset.strftime('%z'))/100)
+                fecha1 = billingCycleDateDto.StartDate
+                fecha2 = billingCycleDateDto.EndDate
+                miami_tz = ZoneInfo("America/New_York")
+                fecha_miami = fecha1.replace(tzinfo=miami_tz)
+                offset = fecha_miami.utcoffset().total_seconds() / 3600
+                fecha_miami_2 = fecha2.replace(tzinfo=miami_tz)
+                offset_2 = fecha_miami_2.utcoffset().total_seconds() / 3600
 
-                custom_time_span = current_offset_hours if custom_gmt == 0 else current_offset_hours - custom_gmt
+                #custom_time_span = current_offset_hours if custom_gmt == 0 else current_offset_hours - custom_gmt
 
-                start_date = billingCycleDateDto.StartDate + timedelta(hours=custom_time_span)
-                end_date = billingCycleDateDto.EndDate + timedelta(hours=custom_time_span)
+                start_date = billingCycleDateDto.StartDate + timedelta(hours=offset if custom_gmt == 0 else offset - custom_gmt)
+                end_date = billingCycleDateDto.EndDate + timedelta(hours=offset_2 if custom_gmt == 0 else offset_2 - custom_gmt)
 
                 data = fetch_AnswerOriginateSms_By_date_carrier(
                     group, start_date, end_date, isAnswer=True
@@ -1244,6 +1262,10 @@ def cross_data(data_answer_sum, data_orig_sum, carrier_list, billing_cycle_id,
 
         return df
 
+    # cross_weekly = apply_quickbox_name(cross_weekly)
+    # cross_fornightly = apply_quickbox_name(cross_fornightly)
+    # cross_monthly = apply_quickbox_name(cross_monthly)
+
     cross_weekly = group_report(cross_weekly, head_first="Weekly")
     cross_fornightly = group_report(cross_fornightly, head_first="Fortnightly")
     cross_monthly = group_report(cross_monthly, head_first="Monthly")
@@ -1432,7 +1454,7 @@ def get_provisionals_sms_fun(model: dict, is_gmt: bool):
         logger.exception(message)
         send_email(to_emails, "Error CrossReport", message)
         return {"status_code": 500, "content": {"error": message}}
- 
+
 def get_provisionals_sms_GMT_fun(model: dict, is_gmt: bool):
     try:
         message = ""
@@ -1680,6 +1702,8 @@ def get_provisionals_sms_GMT_fun(model: dict, is_gmt: bool):
         send_email(to_emails, "Error CrossReport_Reconciliation", message)
         return {"status_code": 500, "content": {"error": message}}
 
+
+
 def fun_handle_get_token(request: TokenRequest):
     try:
         body = request.dict()
@@ -1694,7 +1718,7 @@ def fun_handle_get_token(request: TokenRequest):
         return JSONResponse(status_code=500)
 
 
-@app.post("/api/sms/token")
+@app.post("/api/Auth/Token")
 async def handle_get_token(request: TokenRequest):
     return fun_handle_get_token(request)
 
