@@ -1,3 +1,20 @@
+"""
+/*************************************************************************
+ * 
+ *  [2022] Identidad Technologies. 
+ *  All Rights Reserved.
+ * 
+ * NOTICE:  All information contained herein is, and remains
+ * the property of Identidad Technologies,
+ * The intellectual and technical concepts contained
+ * herein are proprietary to Identidad Technologies
+ * Dissemination of this information or reproduction of this material
+ * is strictly forbidden unless prior written permission is obtained
+ * from Identidad Technologies.
+ */
+"""
+
+
 import os
 import time
 import requests
