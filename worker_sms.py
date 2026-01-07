@@ -474,7 +474,12 @@ def create_answer_importer_excel_dto(
     if carrier is None:
         customer_value = f"carrier no existe {answer_data.Client}"
     else:
-        quickbox = carrier.get("ClientQuickBoxName") or f"Nombre Quickbox no existe {carrier.get('Name')}"
+        quickbox = (
+        f"{carrier.get("ClientQuickBoxName")}"
+        if carrier.get("ClientQuickBoxName") and carrier.get("ClientQuickBoxName").strip()
+        else f"{carrier.get('Name')}"
+        )
+
         multi_currency = False if currency_info is None else not currency_info.Result
         if not multi_currency:
             cur_code = answer_data.ClientCurrencyCode or ""

@@ -17,14 +17,49 @@ TIMEOUT = 120  # segundos
 def iso_now():
     return datetime.datetime.now().isoformat()
 
+def get_token():
+    AUTH_URL = f"{BASE_URL}Auth/Token"
+    payload = {
+        "username": "apollo",
+        "password": "1d3nt1d@d5m5."
+    }
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    response = requests.post(AUTH_URL, json=payload, headers=headers, timeout=TIMEOUT)
+
+    if response.status_code != 200:
+        raise Exception(f"Error obteniendo token: {response.status_code} - {response.text}")
+
+    data = response.json()
+
+    return data['token']
+
 def post_endpoint(endpoint, payload, desc=""):
     url = f"{BASE_URL}{endpoint}"
+
     try:
-        response = requests.post(url, json=payload, headers=HEADERS, timeout=TIMEOUT)
+        token = get_token()
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=TIMEOUT
+        )
+
         if 200 <= response.status_code < 300:
             print(f"{desc} [{endpoint}] -> OK")
         else:
             print(f"{desc} [{endpoint}] -> Error {response.status_code}: {response.text}")
+
     except Exception as e:
         print(f"{desc} [{endpoint}] -> Excepción: {e}")
 
@@ -73,7 +108,7 @@ def post_monthly_edrs(start, end, billing_cycle):
     post_endpoint(url, data, "RawAnswerSm/MonthlyEdrs")
 
 def post_answer_sms_gmt_carriers(start, end, billing_cycle, invoice_number):
-    url = f"sms/RawAnswerSm/GMTCarriers?billing_cycle={billing_cycle}&InvoiceNumber={invoice_number}"
+    url = f"sms/RawAnswerSms/GMTCarriers?billing_cycle={billing_cycle}&InvoiceNumber={invoice_number}"
     data = {"StartDate": start, "EndDate": end}
     post_endpoint(url, data, "RawAnswerSm/GMTCarriers")
 
@@ -122,6 +157,8 @@ def main():
 
         print("Ejecutando ciclo semanal...")
 
+
+
         # Ejecuta endpoints semanales
         post_originate_sms_gmt(start, end, billing_cycle)
         post_raw_originate_sms(start, end, billing_cycle)
@@ -158,7 +195,7 @@ def main():
             post_provisionals_sms(start, end, billing_cycle, currency_id)
             post_provisionals_gmt_sms(start, end, billing_cycle, currency_id)
         
-        day = 16  # Para ejecutar también el ciclo quincenal
+        day = 18  # Para ejecutar también el ciclo quincenal
 
     # --------------------------
     # 16 → QUINCENALES
